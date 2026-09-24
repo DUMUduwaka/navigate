@@ -550,9 +550,9 @@ class MenuController(GUIController):
 
         # Create a variable to track histogram state
         self.histogram_enabled = tk.BooleanVar(
-            value=self.parent_controller.configuration["gui"].get("histogram", {}).get(
-                "enabled", True
-            )
+            value=self.parent_controller.configuration["gui"]
+            .get("histogram", {})
+            .get("enabled", True)
         )
 
         # Add radiobuttons to the histogram submenu
@@ -575,9 +575,9 @@ class MenuController(GUIController):
 
         # Create a variable to track MIP display state.
         self.mip_enabled = tk.BooleanVar(
-            value=self.parent_controller.configuration["gui"].get("mip_display", {}).get(
-                "enabled", True
-            )
+            value=self.parent_controller.configuration["gui"]
+            .get("mip_display", {})
+            .get("enabled", True)
         )
 
         # Add radiobuttons to the histogram submenu
@@ -1049,7 +1049,9 @@ class MenuController(GUIController):
         if hasattr(self.parent_controller, "adaptiveoptics_popup_controller"):
             self.parent_controller.ao_popup_controller.showup()
             return
-        ao_popup = AdaptiveOpticsPopup(self.view)
+        ao_popup = AdaptiveOpticsPopup(
+            self.view, configuration=self.parent_controller.configuration
+        )
         self.parent_controller.ao_popup_controller = AdaptiveOpticsPopupController(
             ao_popup, self.parent_controller
         )
@@ -1084,8 +1086,8 @@ class MenuController(GUIController):
             return
 
         popup = GuiSettingsPopup(self.view)
-        self.parent_controller.gui_settings_popup_controller = GuiSettingsPopupController(
-            popup, self.parent_controller
+        self.parent_controller.gui_settings_popup_controller = (
+            GuiSettingsPopupController(popup, self.parent_controller)
         )
 
     @log_function_call
@@ -1349,7 +1351,9 @@ class MenuController(GUIController):
             self.parent_controller,
             persist_feature_list_edits=True,
         )
-        self.parent_controller.features_popup_controller.populate_feature_list(feature_id)
+        self.parent_controller.features_popup_controller.populate_feature_list(
+            feature_id
+        )
 
     @log_function_call
     def load_feature_list(self) -> None:

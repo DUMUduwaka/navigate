@@ -40,6 +40,11 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Local application imports
+from navigate.model.devices.adaptive_optics_modes import (
+    MIRROR_MODE_NAMES,
+    get_active_mirror_manufacturer,
+    get_mode_names,
+)
 from navigate.view.custom_widgets.popup import PopUp
 from navigate.view.custom_widgets.LabelInputWidgetFactory import LabelInput
 from navigate.view.theme import get_theme_padding_px, get_theme_space_px
@@ -94,7 +99,7 @@ class ScrollFrame(ttk.Frame):
 class AdaptiveOpticsPopup:
     """Adaptive Optics Popup"""
 
-    def __init__(self, root, *args, **kwargs):
+    def __init__(self, root, configuration=None, *args, **kwargs):
         """Initialize AdaptiveOpticsPopup
 
         Creating popup window with this name and size/placement, PopUp is a
@@ -104,50 +109,29 @@ class AdaptiveOpticsPopup:
         ----------
         root : tk.Tk
             Root window
+        configuration : dict, optional
+            Global configuration, used to build the mode list from whichever
+            mirror manufacturer (Imagine Optics or Phaseform DPP) the active
+            microscope has. If omitted, falls back to the Imagine Optics
+            mode list.
         """
         #: PopUp: Popup
         self.popup = PopUp(
             root, "Adaptive Optics", "1100x550+320+180", top=False, transient=False
         )
 
-        #: list: List of mode names
-        self.mode_names = [
-            "Vert. Tilt",
-            "Horz. Tilt",
-            "Defocus",
-            "Vert. Asm.",
-            "Oblq. Asm.",
-            "Vert. Coma",
-            "Horz. Coma",
-            "3rd Spherical",
-            "Vert. Tre.",
-            "Horz. Tre.",
-            "Vert. 5th Asm.",
-            "Oblq. 5th Asm.",
-            "Vert. 5th Coma",
-            "Horz. 5th Coma",
-            "5th Spherical",
-            "Vert. Tetra.",
-            "Oblq. Tetra.",
-            "Vert. 7th Tre.",
-            "Horz. 7th Tre.",
-            "Vert. 7th Asm.",
-            "Oblq. 7th Asm.",
-            "Vert. 7th Coma",
-            "Horz. 7th Coma",
-            "7th Spherical",
-            "Vert. Penta.",
-            "Horz. Penta.",
-            "Vert. 9th Tetra.",
-            "Oblq. 9th Tetra.",
-            "Vert. 9th Tre.",
-            "Horz. 9th Tre.",
-            "Vert. 9th Asm.",
-            "Oblq. 9th Asm.",
-        ]
+        #: str or None: Which mirror manufacturer the active microscope has.
+        self.mirror_manufacturer = (
+            get_active_mirror_manufacturer(configuration) if configuration else None
+        )
+
+        #: list: List of mode names, in the active manufacturer's native order.
+        self.mode_names = get_mode_names(self.mirror_manufacturer) or list(
+            MIRROR_MODE_NAMES
+        )
 
         #: int: Number of modes
-        self.n_modes = 32  # TODO: Don't hardcode... Get from exp file!
+        self.n_modes = len(self.mode_names)
 
         content_frame = self.popup.get_frame()
 
@@ -271,12 +255,18 @@ class AdaptiveOpticsPopup:
         self.clear_button.grid(row=3, column=0, pady=get_theme_space_px(5))
 
         #: ttk.Button: Save Button
-        self.save_wcs_button = ttk.Button(button_frame, text="Save WCS File", width=15)
-        self.save_wcs_button.grid(row=0, column=1, pady=get_theme_space_px(5))
+        save_text = (
+            "Save JSON File" if self.mirror_manufacturer == "dpp" else "Save WCS File"
+        )
+        self.save_button = ttk.Button(button_frame, text=save_text, width=15)
+        self.save_button.grid(row=0, column=1, pady=get_theme_space_px(5))
 
         #: ttk.Button: Load Button
-        self.from_wcs_button = ttk.Button(button_frame, text="From WCS File", width=15)
-        self.from_wcs_button.grid(row=1, column=1, pady=get_theme_space_px(5))
+        load_text = (
+            "From JSON File" if self.mirror_manufacturer == "dpp" else "From WCS File"
+        )
+        self.load_button = ttk.Button(button_frame, text=load_text, width=15)
+        self.load_button.grid(row=1, column=1, pady=get_theme_space_px(5))
 
         #: ttk.Button: Select All Button
         self.select_all_modes = ttk.Button(button_frame, text="Select All", width=15)

@@ -42,6 +42,7 @@ from scipy.optimize import curve_fit
 
 # Local imports
 from navigate.config.configuration_schema import SettingSpec
+from navigate.model.devices import adaptive_optics_modes
 from navigate.model.features.base import FeatureBase
 from navigate.model.features.common_features import PrepareNextChannel
 import navigate.model.analysis.image_contrast as img_contrast
@@ -198,11 +199,12 @@ class TonyWilson(FeatureBase):
             "AdaptiveOpticsParameters"
         ]["TonyWilson"]
 
-        #: navigate.model.devices.mirrors.mirror_imop.ImagineOpticsMirror: Mirror object
-        self.mirror_controller = self.model.active_microscope.mirror.mirror_controller
+        #: navigate.model.devices.mirror.imop.ImagineOpticsMirror or
+        #: navigate.model.devices.mirror.dpp.PhaseformDPPMirror: Mirror object
+        self.mirror = self.model.active_microscope.mirror
 
         #: int: Number of modes
-        self.n_modes = self.mirror_controller.n_modes
+        self.n_modes = adaptive_optics_modes.DEFAULT_N_MODES
 
         #: bool: whether to save report at the end of run
         self.save_report = self.model.configuration["experiment"][
@@ -214,7 +216,7 @@ class TonyWilson(FeatureBase):
         modes_armed_dict = self.tw_settings["modes_armed"]
 
         #: list: List of mode names
-        self.mode_names = modes_armed_dict.keys()
+        self.mode_names = list(modes_armed_dict.keys())
         for i, k in enumerate(self.mode_names):
             if modes_armed_dict[k]:
                 self.change_coef += [i]
@@ -365,9 +367,9 @@ class TonyWilson(FeatureBase):
         out_str += f"\tApply:\t[{' '.join([f'{c:.2f}' for c in applied_coefs])}]\n"
 
         # Update the mirror...
-        self.mirror_controller.flat()
+        self.mirror.flat()
         try:
-            self.mirror_controller.display_modes(applied_coefs)
+            self.mirror.display_modes(applied_coefs)
         except Exception as e:
             print(e)
             return
@@ -375,7 +377,7 @@ class TonyWilson(FeatureBase):
         time.sleep(self.model.active_microscope.current_exposure_time / 1000)
 
         try:
-            curr_mirror_coefs = self.mirror_controller.get_modal_coefs()[0]
+            curr_mirror_coefs = self.mirror.get_modal_coefs()[0]
 
             out_str += (
                 f"\tCoefs:\t[{' '.join([f'{c:.2f}' for c in curr_mirror_coefs])}]\n"
@@ -491,7 +493,7 @@ class TonyWilson(FeatureBase):
         self.best_coefs[self.change_coef[coef - 1]] += (
             self.x_fit[self.y_fit.argmax()] * r_2
         )  # weight by R^2 goodness of fit
-        self.mirror_img = self.mirror_controller.get_wavefront_pix()
+        self.mirror_img = self.mirror.mirror_controller.get_wavefront_pix()
 
         new_metric = self.plot_data[int(self.n_steps / 2)]
         self.best_peaks.append(new_metric)
@@ -651,7 +653,7 @@ class TonyWilson(FeatureBase):
 
         self.done_itr = False
 
-        self.mirror_controller.display_modes(self.best_coefs_overall)
+        self.mirror.display_modes(self.best_coefs_overall)
 
         if self.done_all and self.save_report:
             self.model.event_queue.put(("ao_save_report", self.report))
