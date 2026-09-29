@@ -194,6 +194,9 @@ class PhaseformDPP:
                             f"operation_mode='{self.operation_mode}') returned False. No exception "
                             "was raised but no valid flat field offsets were loaded. "
                         )
+
+            if self.dpp.influence_matrix_loaded and self.dpp.corrections_loaded:
+                self.dpp.get_ampls_limits()
         except Exception:
             self.disconnect()
             raise
@@ -342,6 +345,24 @@ class PhaseformDPP:
         coefs = list(coefs[1 : self.n_modes])
         coefs_idx = list(range(1, len(coefs) + 1))  # exclude piston
         return (coefs, coefs_idx)
+
+    def get_amplitude_limits(self):
+        """
+        Per-mode achievable +/- amplitude, computed once from the
+        calibration loaded at connect() time.
+
+        Returns
+        -------
+        tuple(list[float], list[float]) or (None, None)
+            (pos_limits, neg_limits), each length self.n_modes - 1, or
+            (None, None) if limits were never computed.
+        """
+        if not self.dpp.ampls_limits_pos_list:
+            return (None, None)
+        return (
+            list(self.dpp.ampls_limits_pos_list[1 : self.n_modes]),
+            list(self.dpp.ampls_limits_neg_list[1 : self.n_modes]),
+        )
 
     def get_wavefront_pix(self):
         return

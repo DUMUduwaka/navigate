@@ -48,6 +48,8 @@ from navigate.model.features.common_features import PrepareNextChannel
 import navigate.model.analysis.image_contrast as img_contrast
 from navigate.model.features.image_writer import ImageWriter
 
+MODAL_APPROXIMATION_TOLERANCE = 0.02
+
 
 def poly2(x, a, b, c):
     """Second order polynomial function
@@ -316,10 +318,6 @@ class TonyWilson(FeatureBase):
         self.n_steps = self.tw_settings["steps"]
         self.coef_amp = self.tw_settings["amplitude"]
 
-        self.coef_sweep = np.linspace(
-            -self.coef_amp, self.coef_amp, self.n_steps
-        ).astype(np.float32)
-
         self.signal_id = 0
         self.target_signal_id = 0
         self.total_frame_num = self.get_tw_frame_num()
@@ -333,6 +331,25 @@ class TonyWilson(FeatureBase):
                 ].values()
             )
             self.best_coefs = np.asarray(curr_expt_coefs, dtype=np.float32)
+
+        # PhaseformDPP mirror's get_amplitude_limits attribute gives the range of
+        # limit that can be reached by the device.
+        positive_limits = negative_limits = None
+        if hasattr(self.mirror, "get_amplitude_limits"):
+            positive_limits, negative_limits = self.mirror.get_amplitude_limits()
+
+        sweeps = []
+        for c in self.change_coef:
+            positive_bound, negative_bound = self.coef_amp, -self.coef_amp
+            if positive_limits is not None:
+                positive_bound = min(
+                    self.coef_amp, max(positive_limits[c] - self.best_coefs[c], 0.0)
+                )
+                negative_bound = max(
+                    -self.coef_amp, min(negative_limits[c] - self.best_coefs[c], 0.0)
+                )
+            sweeps.append(np.linspace(negative_bound, positive_bound, self.n_steps))
+        self.coef_sweep = np.asarray(sweeps, dtype=np.float32)  # (n_coefs, n_steps)
 
         self.best_coefs_overall = deepcopy(self.best_coefs)
         self.best_metric = 0.0
@@ -360,7 +377,7 @@ class TonyWilson(FeatureBase):
 
         coef_arr = np.zeros(self.n_modes, dtype=np.float32)
         c = self.change_coef[coef]
-        coef_arr[c] = self.coef_sweep[step]
+        coef_arr[c] = self.coef_sweep[coef, step]
 
         applied_coefs = coef_arr + self.best_coefs
 
@@ -394,20 +411,29 @@ class TonyWilson(FeatureBase):
             f"*** TonyWilson > in_func_signal :: display_modes:[{coef_str}]"
         )
 
-        if (applied_coefs == curr_mirror_coefs).all() or (applied_coefs == 0).all():
-            self.signal_id += 1
-
-            self.tw_frame_queue.put(
-                (
-                    self.model.frame_id,
-                    self.total_frame_num - self.signal_id,
-                    itr,
-                    coef,
-                    step,
-                )
+        coefs_mismatch = float(np.max(np.abs(applied_coefs - curr_mirror_coefs)))
+        if coefs_mismatch > MODAL_APPROXIMATION_TOLERANCE:
+            worst_mode_idx = int(np.argmax(np.abs(applied_coefs - curr_mirror_coefs)))
+            out_str += (
+                f"\tMirror did not fully reach the commanded coefficients "
+                f"(max |delta|={coefs_mismatch:.3f} at mode index {worst_mode_idx}); "
+                "proceeding with the achieved value.\n"
             )
-        else:
-            out_str += "\tMirror update failed...\n"
+            self.model.logger.debug(
+                f"*** TonyWilson > in_func_signal :: saturation coefficient mismatch "
+                f"{coefs_mismatch:.4f} at mode {worst_mode_idx}"
+            )
+
+        self.signal_id += 1
+        self.tw_frame_queue.put(
+            (
+                self.model.frame_id,
+                self.total_frame_num - self.signal_id,
+                itr,
+                coef,
+                step,
+            )
+        )
 
         if self.verbose:
             print(out_str)
@@ -441,7 +467,12 @@ class TonyWilson(FeatureBase):
         self.total_frame_num = self.get_tw_frame_num()
         self.x = self.coef_sweep
         self.y = []
-        self.x_fit = np.linspace(-self.coef_amp, self.coef_amp, 1024)
+        self.x_fit = np.stack(
+            [
+                np.linspace(self.coef_sweep[j, 0], self.coef_sweep[j, -1], 1024)
+                for j in range(self.n_coefs)
+            ]
+        )
         self.y_fit = []
         self.mirror_img = None
 
@@ -458,40 +489,42 @@ class TonyWilson(FeatureBase):
             Fitting mode, by default "poly"
         """
         self.y = self.plot_data
+        x = self.x[coef - 1]
+        x_fit = self.x_fit[coef - 1]
 
         if mode == "poly":
             c = np.min(self.y)  # offset guess
-            b = (np.max(self.y) - c) / self.coef_amp  # slope guess
+            b = (np.max(self.y) - c) / max(abs(x[-1]), abs(x[0]), 1e-6)  # slope guess
             a = -b / 2
 
             p, _ = curve_fit(
                 poly2,
-                self.x,
+                x,
                 self.y,
                 p0=[a, b, c],
                 bounds=([-np.inf, -np.inf, -np.inf], [0.0, np.inf, np.inf]),
             )
-            self.y_fit = poly2(self.x_fit, p[0], p[1], p[2])
-            r_2 = r_squared(self.y, poly2(self.x, p[0], p[1], p[2]))
+            self.y_fit = poly2(x_fit, p[0], p[1], p[2])
+            r_2 = r_squared(self.y, poly2(x, p[0], p[1], p[2]))
 
         elif mode == "gauss":
             d = np.min(self.y)
             a = np.max(self.y) - d
-            b = self.x[np.argmax(self.y)]
-            c = (self.x[-1] - self.x[0]) / 2
+            b = x[np.argmax(self.y)]
+            c = (x[-1] - x[0]) / 2
 
             p, _ = curve_fit(
                 gauss,
-                self.x,
+                x,
                 self.y,
                 p0=[a, b, c, d],
                 bounds=([0, -np.inf, 0, 0], [np.inf, np.inf, np.inf, np.inf]),
             )
-            self.y_fit = gauss(self.x_fit, p[0], p[1], p[2], p[3])
-            r_2 = r_squared(self.y, gauss(self.x, p[0], p[1], p[2], p[3]))
+            self.y_fit = gauss(x_fit, p[0], p[1], p[2], p[3])
+            r_2 = r_squared(self.y, gauss(x, p[0], p[1], p[2], p[3]))
 
         self.best_coefs[self.change_coef[coef - 1]] += (
-            self.x_fit[self.y_fit.argmax()] * r_2
+            x_fit[self.y_fit.argmax()] * r_2
         )  # weight by R^2 goodness of fit
         self.mirror_img = self.mirror.mirror_controller.get_wavefront_pix()
 
@@ -556,10 +589,10 @@ class TonyWilson(FeatureBase):
 
             if len(self.plot_data) == self.n_steps:
                 self.process_data(coef, mode=self.fit_func)
-                self.trace_list[self.mode_names[self.change_coef[coef]]] = {
-                    "x": self.x,
+                self.trace_list[self.mode_names[self.change_coef[coef - 1]]] = {
+                    "x": self.x[coef - 1],
                     "y": self.y,
-                    "x_fit": self.x_fit[::32],
+                    "x_fit": self.x_fit[coef - 1][::32],
                     "y_fit": self.y_fit[::32],
                 }
                 out_str += "\tFITTING DATA...\n"
