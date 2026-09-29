@@ -96,6 +96,10 @@ def dpp_module(monkeypatch):
             )
             return ([0.1, 0.2], [1, 2])
 
+        def get_amplitude_limits(self):
+            self.calls.append(("get_amplitude_limits", {}))
+            return ([0.5] * 32, [-0.4] * 32)
+
         def load_json(self, path=None, name=None):
             self.calls.append(("load_json", {"path": path, "name": name}))
             return {
@@ -202,6 +206,28 @@ def test_get_modal_coefs_passes_only_commanded_false(
 
     assert modal_coefs == ([0.1, 0.2], [1, 2])
     assert controller.calls == [("get_modal_coefs", {"only_commanded": False})]
+
+
+def test_get_amplitude_limits_forwards_to_controller(
+    dpp_module,
+    mirror_configuration,
+):
+    """Verify the mirror forwards to the controller's amplitude-limits query."""
+    module, fake_class = dpp_module
+    controller = fake_class()
+
+    mirror = module.PhaseformDPPMirror(
+        "scope-a",
+        controller,
+        mirror_configuration,
+    )
+
+    controller.calls.clear()
+
+    limits = mirror.get_amplitude_limits()
+
+    assert limits == ([0.5] * 32, [-0.4] * 32)
+    assert controller.calls == [("get_amplitude_limits", {})]
 
 
 def test_json_file_methods_forward_arguments_and_convert_loaded_coefs(

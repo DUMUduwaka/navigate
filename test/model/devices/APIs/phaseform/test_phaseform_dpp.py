@@ -69,13 +69,14 @@ class FakePyCtrlDPP:
         self.connected = True
         self.influence_matrix = np.zeros((N_TERMS, N_CHANNELS))
         self.flatten_field_coefficients = None
+        self.influence_matrix_loaded = False
         self.corrections_loaded = False
         self.default_calibrations_path = None
         self.voltages = np.zeros(shape=N_RAW_VOLTAGE_SLOTS, dtype="uint16")
         self.max_osa_index = N_TERMS - 1
         self._approx_ampls = [0.0] + [round(0.1 * i, 4) for i in range(1, N_TERMS)]
-        # Confirmed against the real library in test_api_dpp_contract.py:
-        # minV=50, maxV=300, and max_voltage starts at maxV.
+        self.ampls_limits_pos_list = []
+        self.ampls_limits_neg_list = []
         self.minV = 50
         self.maxV = 300
         self.max_voltage = self.maxV
@@ -89,22 +90,23 @@ class FakePyCtrlDPP:
 
     def set_max_voltage(self, v):
         self.calls.append(("set_max_voltage", v))
-        # Mirrors the real PyCtrlDPP.set_max_voltage(): silently leaves
-        # max_voltage unchanged when out of [minV, maxV] -- confirmed in
-        # test_api_dpp_contract.py's test_set_max_voltage_* tests.
         if self.minV <= v <= self.maxV:
             self.max_voltage = v
 
     def load_precalibration(self, operation_mode="v"):
         self.calls.append(("load_precalibration", operation_mode))
+        self.influence_matrix_loaded = True
+        self.corrections_loaded = True
         return True
 
     def load_infl_matrix(self, abs_path="", operation_mode="h"):
         self.calls.append(("load_infl_matrix", abs_path, operation_mode))
+        self.influence_matrix_loaded = True
         return True
 
     def load_flat_field(self, abs_path="", operation_mode="v"):
         self.calls.append(("load_flat_field", abs_path, operation_mode))
+        self.corrections_loaded = True
         return True
 
     def apply_flat_field(self):
@@ -119,6 +121,16 @@ class FakePyCtrlDPP:
     def get_approx_ampls(self, get_all_approximated=False):
         self.calls.append(("get_approx_ampls", get_all_approximated))
         return list(self._approx_ampls)
+
+    def get_ampls_limits(self):
+        self.calls.append(("get_ampls_limits",))
+        self.ampls_limits_pos_list = [0.0] + [
+            round(1.0 - 0.01 * i, 4) for i in range(1, N_TERMS)
+        ]
+        self.ampls_limits_neg_list = [0.0] + [
+            round(-0.9 + 0.01 * i, 4) for i in range(1, N_TERMS)
+        ]
+        return True
 
     def set_pins_volts(self, pins2voltages):
         self.calls.append(("set_pins_volts", pins2voltages))
@@ -246,6 +258,7 @@ def test_connect_calls_happen_in_the_right_order(patched_pyctrldpp):
         "set_max_voltage",
         "load_infl_matrix",
         "load_flat_field",
+        "get_ampls_limits",
     ]
 
 
@@ -352,8 +365,10 @@ def test_connect_closes_the_connection_when_calibration_loading_fails(
 def test_connect_called_again_reruns_calibration_load_but_not_handshake(
     patched_pyctrldpp,
 ):
-    """Documented behavior: connect() only performs the serial handshake once
-    (guarded by _is_connected), but re-runs calibration loading every call."""
+    """
+    Documented behavior: connect() only performs the serial handshake once
+    (guarded by _is_connected), but re-runs calibration loading every call.
+    """
     plate = make_plate()
     plate.dpp.calls.clear()
 
@@ -362,7 +377,8 @@ def test_connect_called_again_reruns_calibration_load_but_not_handshake(
     call_names = [c[0] for c in plate.dpp.calls]
     assert "connect_device" not in call_names
     assert call_names.count("load_infl_matrix") == 1
-    assert call_names.count("load_flat_field") == 1
+    assert call_names.count("load_flat_field") == 0
+    assert call_names.count("get_ampls_limits") == 1
 
 
 def test_reconnect_after_disconnect_reruns_the_full_handshake(patched_pyctrldpp):

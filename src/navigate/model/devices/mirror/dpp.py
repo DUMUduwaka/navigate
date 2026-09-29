@@ -178,11 +178,7 @@ class PhaseformDPPMirror(MirrorBase, IntegratedDevice):
     def get_modal_coefs(self):
         """Get the modal coefficients of the mirror.
 
-        Uses only_commanded=False so the result is a dense,
-        positionally-ordered array (like ImagineOpticsMirror's), rather than
-        PhaseformDPP's default sparse (non-zero modes only) readout --
-        callers that drive both manufacturers generically (e.g. TonyWilson's
-        convergence check) need a consistent, comparable shape.
+        Uses only_commanded=False so the result is a dense.
 
         Returns
         -------
@@ -191,6 +187,16 @@ class PhaseformDPPMirror(MirrorBase, IntegratedDevice):
             device, dense across all 32 real modes.
         """
         return self.mirror_controller.get_modal_coefs(only_commanded=False)
+
+    def get_amplitude_limits(self):
+        """Per-mode achievable +/- amplitude limits.
+
+        Returns
+        -------
+        tuple(list[float], list[float]) or (None, None)
+            (pos_limits, neg_limits), see PhaseformDPP.get_amplitude_limits().
+        """
+        return self.mirror_controller.get_amplitude_limits()
 
     def set_from_json_file(self, path=None, name=None):
         """Load a saved Zernike coefficient file and apply it.
