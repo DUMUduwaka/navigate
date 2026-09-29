@@ -34,10 +34,11 @@ import re
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Optional, Union
 
 import yaml
 
+from navigate.config.config import get_navigate_path
 from navigate.config.configuration_schema import (
     CollectionSpec,
     SettingSpec,
@@ -163,8 +164,12 @@ class Configurator:
         self.view.device_info_frame.horizontal_scrollbar.config(
             command=self.view.device_info_frame.settings_canvas.xview
         )
+        self.view.device_info_frame.vertical_scrollbar.config(
+            command=self.view.device_info_frame.settings_canvas.yview
+        )
         self.view.device_info_frame.settings_canvas.config(
-            xscrollcommand=self.view.device_info_frame.horizontal_scrollbar.set
+            xscrollcommand=self.view.device_info_frame.horizontal_scrollbar.set,
+            yscrollcommand=self.view.device_info_frame.vertical_scrollbar.set,
         )
 
     def on_cancel(self) -> None:
@@ -937,6 +942,10 @@ class Configurator:
                 "axes_mapping",
             }:
                 device["hardware"][name] = InlineYamlList(self.parse_stage_axes(value))
+            elif category == "stage" and name == "feedback_alignment":
+                device["hardware"][name] = InlineYamlList(
+                    self.parse_stage_feedback_alignment(value)
+                )
             elif category == "stage" and name == "joystick_axes":
                 device[name] = InlineYamlList(self.parse_stage_axes(value))
             elif category == "stage" and name == "coupled_axes":
@@ -1084,7 +1093,9 @@ class Configurator:
             dialog_options["initialdir"] = str(self.last_configuration_path.parent)
             dialog_options["initialfile"] = self.last_configuration_path.name
         else:
-            dialog_options["initialfile"] = "new-config.yaml"
+            base = Path(get_navigate_path())
+            dialog_options["initialdir"] = str(base.joinpath("config"))
+            dialog_options["initialfile"] = "configuration.yaml"
         filename = filedialog.asksaveasfilename(**dialog_options)
         if not filename:
             return
@@ -1359,6 +1370,23 @@ class Configurator:
             for axis in re.split(r"[\s,]+", str(value).strip().strip("[]"))
             if axis.strip("'\"")
         ]
+
+    @classmethod
+    def parse_stage_feedback_alignment(cls, value: str) -> list[Union[int, float, str]]:
+        """Convert ASI feedback alignment into a list without stringifying numbers."""
+        return [cls.parse_numeric_token(token) for token in cls.parse_stage_axes(value)]
+
+    @staticmethod
+    def parse_numeric_token(value: object) -> Union[int, float, str]:
+        """Return an int or float for numeric text; otherwise return stripped text."""
+        token = str(value).strip().strip("'\"")
+        if re.fullmatch(r"[-+]?\d+", token):
+            return int(token)
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", token):
+            return float(token)
+        if re.fullmatch(r"[-+]?\d+[eE][-+]?\d+", token):
+            return float(token)
+        return token
 
     @staticmethod
     def parse_coupled_axes(value: str) -> dict[str, str]:
@@ -1730,7 +1758,7 @@ class Configurator:
         )
 
     def update_scrollregion(self, _event: tk.Event) -> None:
-        """Update horizontal scrolling for dynamically created setting widgets."""
+        """Update scrolling for dynamically created setting widgets."""
         canvas = self.view.device_info_frame.settings_canvas
         canvas.configure(scrollregion=canvas.bbox(tk.ALL))
 

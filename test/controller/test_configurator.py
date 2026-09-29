@@ -3,8 +3,14 @@
 
 """Regression tests for configuration-assistant serialization helpers."""
 
+import yaml
+
 from navigate.controller import configurator as configurator_module
-from navigate.controller.configurator import Configurator, InlineYamlList
+from navigate.controller.configurator import (
+    Configurator,
+    ConfiguratorYamlDumper,
+    InlineYamlList,
+)
 from navigate.config.configuration_schema import SettingSpec
 from navigate.model.devices.zoom.base import ZoomBase
 
@@ -376,3 +382,28 @@ def test_stage_shared_axes_load_as_text_values():
 
     assert settings["joystick_axes"] == "x, y, z"
     assert settings["coupled_axes"] == "x:x1, y:y1"
+
+
+def test_stage_feedback_alignment_round_trips_as_inline_yaml_list():
+    """ASI feedback alignment is saved with the same list behavior as axes."""
+    configurator = Configurator.__new__(Configurator)
+    configurator.get_connect_params = lambda *_: []
+    configurator.get_configuration_schema = lambda *_: {
+        "feedback_alignment": SettingSpec(str),
+    }
+
+    settings = configurator.settings_from_configuration(
+        "stage",
+        "asi",
+        "ASIStage",
+        {"hardware": {"feedback_alignment": [88, 99, 101]}},
+    )
+    device = configurator.device_configuration(
+        "stage", "asi", "ASIStage", settings
+    )
+    dumped = yaml.dump(device, Dumper=ConfiguratorYamlDumper, sort_keys=False)
+
+    assert settings["feedback_alignment"] == [88, 99, 101]
+    assert isinstance(device["hardware"]["feedback_alignment"], InlineYamlList)
+    assert device["hardware"]["feedback_alignment"] == [88, 99, 101]
+    assert "feedback_alignment: [88, 99, 101]" in dumped
