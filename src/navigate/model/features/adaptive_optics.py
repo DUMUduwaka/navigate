@@ -343,13 +343,16 @@ class TonyWilson(FeatureBase):
             positive_bound, negative_bound = self.coef_amp, -self.coef_amp
             if positive_limits is not None:
                 positive_bound = min(
-                    self.coef_amp, max(positive_limits[c] - self.best_coefs[c], 0.0)
+                    self.coef_amp, max(
+                        positive_limits[c] - self.best_coefs[c], 0.0)
                 )
                 negative_bound = max(
                     -self.coef_amp, min(negative_limits[c] - self.best_coefs[c], 0.0)
                 )
-            sweeps.append(np.linspace(negative_bound, positive_bound, self.n_steps))
-        self.coef_sweep = np.asarray(sweeps, dtype=np.float32)  # (n_coefs, n_steps)
+            sweeps.append(np.linspace(negative_bound,
+                          positive_bound, self.n_steps))
+        self.coef_sweep = np.asarray(
+            sweeps, dtype=np.float32)  # (n_coefs, n_steps)
 
         self.best_coefs_overall = deepcopy(self.best_coefs)
         self.best_metric = 0.0
@@ -411,9 +414,11 @@ class TonyWilson(FeatureBase):
             f"*** TonyWilson > in_func_signal :: display_modes:[{coef_str}]"
         )
 
-        coefs_mismatch = float(np.max(np.abs(applied_coefs - curr_mirror_coefs)))
+        coefs_mismatch = float(
+            np.max(np.abs(applied_coefs - curr_mirror_coefs)))
         if coefs_mismatch > MODAL_APPROXIMATION_TOLERANCE:
-            worst_mode_idx = int(np.argmax(np.abs(applied_coefs - curr_mirror_coefs)))
+            worst_mode_idx = int(
+                np.argmax(np.abs(applied_coefs - curr_mirror_coefs)))
             out_str += (
                 f"\tMirror did not fully reach the commanded coefficients "
                 f"(max |delta|={coefs_mismatch:.3f} at mode index {worst_mode_idx}); "
@@ -469,7 +474,8 @@ class TonyWilson(FeatureBase):
         self.y = []
         self.x_fit = np.stack(
             [
-                np.linspace(self.coef_sweep[j, 0], self.coef_sweep[j, -1], 1024)
+                np.linspace(self.coef_sweep[j, 0],
+                            self.coef_sweep[j, -1], 1024)
                 for j in range(self.n_coefs)
             ]
         )
@@ -491,42 +497,54 @@ class TonyWilson(FeatureBase):
         self.y = self.plot_data
         x = self.x[coef - 1]
         x_fit = self.x_fit[coef - 1]
+        mode_label = self.mode_names[self.change_coef[coef - 1]]
 
-        if mode == "poly":
-            c = np.min(self.y)  # offset guess
-            b = (np.max(self.y) - c) / max(abs(x[-1]), abs(x[0]), 1e-6)  # slope guess
-            a = -b / 2
+        try:
+            if mode == "poly":
+                c = np.min(self.y)  # offset guess
+                b = (np.max(self.y) - c) / \
+                    max(abs(x[-1]), abs(x[0]), 1e-6)  # slope guess
+                a = -b / 2
 
-            p, _ = curve_fit(
-                poly2,
-                x,
-                self.y,
-                p0=[a, b, c],
-                bounds=([-np.inf, -np.inf, -np.inf], [0.0, np.inf, np.inf]),
-            )
-            self.y_fit = poly2(x_fit, p[0], p[1], p[2])
-            r_2 = r_squared(self.y, poly2(x, p[0], p[1], p[2]))
+                p, _ = curve_fit(
+                    poly2,
+                    x,
+                    self.y,
+                    p0=[a, b, c],
+                    bounds=([-np.inf, -np.inf, -np.inf],
+                            [0.0, np.inf, np.inf]),
+                )
+                self.y_fit = poly2(x_fit, p[0], p[1], p[2])
+                r_2 = r_squared(self.y, poly2(x, p[0], p[1], p[2]))
 
-        elif mode == "gauss":
-            d = np.min(self.y)
-            a = np.max(self.y) - d
-            b = x[np.argmax(self.y)]
-            c = (x[-1] - x[0]) / 2
+            elif mode == "gauss":
+                d = np.min(self.y)
+                a = np.max(self.y) - d
+                b = x[np.argmax(self.y)]
+                c = (x[-1] - x[0]) / 2
 
-            p, _ = curve_fit(
-                gauss,
-                x,
-                self.y,
-                p0=[a, b, c, d],
-                bounds=([0, -np.inf, 0, 0], [np.inf, np.inf, np.inf, np.inf]),
-            )
-            self.y_fit = gauss(x_fit, p[0], p[1], p[2], p[3])
-            r_2 = r_squared(self.y, gauss(x, p[0], p[1], p[2], p[3]))
+                p, _ = curve_fit(
+                    gauss,
+                    x,
+                    self.y,
+                    p0=[a, b, c, d],
+                    bounds=([0, -np.inf, 0, 0],
+                            [np.inf, np.inf, np.inf, np.inf]),
+                )
+                self.y_fit = gauss(x_fit, p[0], p[1], p[2], p[3])
+                r_2 = r_squared(self.y, gauss(x, p[0], p[1], p[2], p[3]))
 
-        self.best_coefs[self.change_coef[coef - 1]] += (
-            x_fit[self.y_fit.argmax()] * r_2
-        )  # weight by R^2 goodness of fit
-        self.mirror_img = self.mirror.mirror_controller.get_wavefront_pix()
+            self.best_coefs[self.change_coef[coef - 1]
+                            ] += x_fit[self.y_fit.argmax()] * max(r_2, 0.0)
+
+        except Exception as exc:
+            self.model.logger.warning(
+                f"TonyWilson: fit failed for mode '{mode_label}' "
+                f"(coef index {coef}): {exc}; leaving this mode's "
+                "correction unchanged this round.")
+            self.y_fit = np.full_like(x_fit, np.nan)
+
+        self.mirror_img = self.mirror.get_wavefront_pix()
 
         new_metric = self.plot_data[int(self.n_steps / 2)]
         self.best_peaks.append(new_metric)
@@ -585,7 +603,8 @@ class TonyWilson(FeatureBase):
             elif self.metric == "Pixel Average":
                 new_data = img.mean()
             elif self.metric == "DCT Shannon Entropy":
-                new_data = img_contrast.fast_normalized_dct_shannon_entropy(img, 3)[0]
+                new_data = img_contrast.fast_normalized_dct_shannon_entropy(img, 3)[
+                    0]
 
             if len(self.plot_data) == self.n_steps:
                 self.process_data(coef, mode=self.fit_func)
@@ -668,25 +687,34 @@ class TonyWilson(FeatureBase):
             self.best_coefs = self.best_coefs_overall
             try:
                 stop_time = time.time()
-                print(f"Total runtime:\t{(stop_time - self.start_time):.3f} sec")
+                print(
+                    f"Total runtime:\t{(stop_time - self.start_time):.3f} sec")
             except Exception as e:
-                print(e)
+                self.model.logger.error(
+                    f"TonyWilson: failed to print runtime: {e}")
 
-        try:
-            if self.done_itr:
+        if self.done_itr:
+            try:
                 current_report = self.build_report()
                 self.report.append(current_report)
 
                 self.model.event_queue.put(
                     ("mirror_update", current_report["mirror_update"])
                 )
-                self.model.event_queue.put(("tonywilson", current_report["tonywilson"]))
-        except Exception as e:
-            print(e)
+                self.model.event_queue.put(
+                    ("tonywilson", current_report["tonywilson"]))
+            except Exception as e:
+                self.model.logger.error(
+                    f"TonyWilson: failed to report progress: {e}")
+
+            try:
+                self.mirror.display_modes(self.best_coefs_overall)
+            except Exception as exc:
+                self.model.logger.error(
+                    f"TonyWilson: failed to re-display best-known correction: {exc}"
+                )
 
         self.done_itr = False
-
-        self.mirror.display_modes(self.best_coefs_overall)
 
         if self.done_all and self.save_report:
             self.model.event_queue.put(("ao_save_report", self.report))

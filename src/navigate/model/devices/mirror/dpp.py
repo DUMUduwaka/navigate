@@ -173,7 +173,8 @@ class PhaseformDPPMirror(MirrorBase, IntegratedDevice):
         coefs : list or dict
             Zernike coefficients to display on the mirror.
         """
-        self.mirror_controller.display_modes(coefs)
+        with self.mirror_lock:
+            self.mirror_controller.display_modes(coefs)
 
     def get_modal_coefs(self):
         """Get the modal coefficients of the mirror.

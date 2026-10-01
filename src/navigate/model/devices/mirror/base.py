@@ -33,6 +33,7 @@
 
 # Standard Library Imports
 import logging
+import threading
 
 # Third Party Imports
 
@@ -72,6 +73,9 @@ class MirrorBase:
         #: object: Hardware device to connect to
         self.mirror_controller = device_connection
 
+        #: threading.Lock: Serializes every real hardware call through mirror_controller.
+        self.mirror_lock = threading.Lock()
+
         #: dict: Configuration of the mirror
         self.mirror_parameters = self.configuration["configuration"]["microscopes"][
             microscope_name
@@ -87,3 +91,8 @@ class MirrorBase:
     def __del__(self) -> None:
         """Delete the MirrorBase class."""
         pass
+
+    def get_wavefront_pix(self):
+        """Return the current wavefront/actuator image for display."""
+        with self.mirror_lock:
+            return self.mirror_controller.get_wavefront_pix()
