@@ -177,8 +177,7 @@ class ImagineOpticsMirror(MirrorBase, IntegratedDevice):
         coefs : list
             List of coefficients to display the mirror modes.
         """
-        with self.mirror_lock:
-            self.mirror_controller.display_modes(coefs)
+        self.mirror_controller.display_modes(coefs)
 
     def get_modal_coefs(self):
         """Get the modal coefficients.
