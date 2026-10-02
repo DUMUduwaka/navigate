@@ -700,3 +700,56 @@ def test_load_feature_records(model, tmp_path, monkeypatch):
     feature_records_2 = load_yaml_file(feature_lists_path / "__sequence.yml")
     assert feature_records == feature_records_2
     os.remove(feature_lists_path / "__sequence.yml")
+
+
+def test_update_mirror_separates_commanded_from_achieved_coefs():
+    from navigate.model.model import Model
+
+    mirror = MagicMock()
+    mirror.get_modal_coefs.return_value = ([0.42, 0.0, 0.0],)
+    mirror.get_wavefront_pix.return_value = "WAVEFRONT_IMG"
+    model = SimpleNamespace(
+        active_microscope=SimpleNamespace(mirror=mirror),
+        event_queue=MagicMock(),
+    )
+
+    Model.update_mirror(model, coef=[0.5, 0.0, 0.0])
+
+    mirror.display_modes.assert_called_once_with([0.5, 0.0, 0.0])
+    model.event_queue.put.assert_called_once_with(
+        (
+            "mirror_update",
+            {
+                "mirror_img": "WAVEFRONT_IMG",
+                "coefs": [0.5, 0.0, 0.0],
+                "achieved_coefs": [0.42, 0.0, 0.0],
+            },
+        )
+    )
+
+
+def test_update_mirror_flatten_reports_zero_commanded():
+    from navigate.model.model import Model
+
+    mirror = MagicMock()
+    mirror.get_modal_coefs.return_value = ([0.01, -0.02, 0.0],)
+    mirror.get_wavefront_pix.return_value = "IMG"
+    model = SimpleNamespace(
+        active_microscope=SimpleNamespace(mirror=mirror),
+        event_queue=MagicMock(),
+    )
+
+    Model.update_mirror(model, coef=[], flatten=True)
+
+    mirror.flat.assert_called_once_with()
+    mirror.display_modes.assert_not_called()
+    model.event_queue.put.assert_called_once_with(
+        (
+            "mirror_update",
+            {
+                "mirror_img": "IMG",
+                "coefs": [0.0, 0.0, 0.0],
+                "achieved_coefs": [0.01, -0.02, 0.0],
+            },
+        )
+    )

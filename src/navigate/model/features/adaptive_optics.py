@@ -478,6 +478,10 @@ class TonyWilson(FeatureBase):
 
         self.frames_done = 0
 
+        self.f_itr = None
+        self.f_coef = None
+        self.f_step = None
+
     def process_data(self, coef, mode="poly"):
         """Process the data
 
@@ -489,44 +493,57 @@ class TonyWilson(FeatureBase):
             Fitting mode, by default "poly"
         """
         self.y = self.plot_data
-        x = self.x[coef - 1]
-        x_fit = self.x_fit[coef - 1]
+        x = self.x[coef]
+        x_fit = self.x_fit[coef]
+        mode_label = self.mode_names[self.change_coef[coef]]
 
-        if mode == "poly":
-            c = np.min(self.y)  # offset guess
-            b = (np.max(self.y) - c) / max(abs(x[-1]), abs(x[0]), 1e-6)  # slope guess
-            a = -b / 2
+        try:
+            if mode == "poly":
+                c = np.min(self.y)  # offset guess
+                b = (np.max(self.y) - c) / max(
+                    abs(x[-1]), abs(x[0]), 1e-6
+                )  # slope guess
+                a = -b / 2
 
-            p, _ = curve_fit(
-                poly2,
-                x,
-                self.y,
-                p0=[a, b, c],
-                bounds=([-np.inf, -np.inf, -np.inf], [0.0, np.inf, np.inf]),
+                p, _ = curve_fit(
+                    poly2,
+                    x,
+                    self.y,
+                    p0=[a, b, c],
+                    bounds=([-np.inf, -np.inf, -np.inf], [0.0, np.inf, np.inf]),
+                )
+                self.y_fit = poly2(x_fit, p[0], p[1], p[2])
+                r_2 = r_squared(self.y, poly2(x, p[0], p[1], p[2]))
+
+            elif mode == "gauss":
+                d = np.min(self.y)
+                a = np.max(self.y) - d
+                b = x[np.argmax(self.y)]
+                c = (x[-1] - x[0]) / 2
+
+                p, _ = curve_fit(
+                    gauss,
+                    x,
+                    self.y,
+                    p0=[a, b, c, d],
+                    bounds=([0, -np.inf, 0, 0], [np.inf, np.inf, np.inf, np.inf]),
+                )
+                self.y_fit = gauss(x_fit, p[0], p[1], p[2], p[3])
+                r_2 = r_squared(self.y, gauss(x, p[0], p[1], p[2], p[3]))
+
+            self.best_coefs[self.change_coef[coef]] += x_fit[self.y_fit.argmax()] * max(
+                r_2, 0.0
             )
-            self.y_fit = poly2(x_fit, p[0], p[1], p[2])
-            r_2 = r_squared(self.y, poly2(x, p[0], p[1], p[2]))
 
-        elif mode == "gauss":
-            d = np.min(self.y)
-            a = np.max(self.y) - d
-            b = x[np.argmax(self.y)]
-            c = (x[-1] - x[0]) / 2
-
-            p, _ = curve_fit(
-                gauss,
-                x,
-                self.y,
-                p0=[a, b, c, d],
-                bounds=([0, -np.inf, 0, 0], [np.inf, np.inf, np.inf, np.inf]),
+        except Exception as exc:
+            self.model.logger.warning(
+                f"TonyWilson: fit failed for mode '{mode_label}' "
+                f"(coef index {coef}): {exc}; leaving this mode's "
+                "correction unchanged this round."
             )
-            self.y_fit = gauss(x_fit, p[0], p[1], p[2], p[3])
-            r_2 = r_squared(self.y, gauss(x, p[0], p[1], p[2], p[3]))
+            self.y_fit = np.full_like(x_fit, np.nan)
 
-        self.best_coefs[self.change_coef[coef - 1]] += (
-            x_fit[self.y_fit.argmax()] * r_2
-        )  # weight by R^2 goodness of fit
-        self.mirror_img = self.mirror.mirror_controller.get_wavefront_pix()
+        self.mirror_img = self.mirror.get_wavefront_pix()
 
         new_metric = self.plot_data[int(self.n_steps / 2)]
         self.best_peaks.append(new_metric)
@@ -563,9 +580,9 @@ class TonyWilson(FeatureBase):
                     (
                         self.f_frame_id,
                         self.frame_num,
-                        itr,
-                        coef,
-                        step,
+                        self.f_itr,
+                        self.f_coef,
+                        self.f_step,
                     ) = self.tw_frame_queue.get_nowait()
                 if self.f_frame_id not in frame_ids:
                     out_str += (
@@ -587,16 +604,6 @@ class TonyWilson(FeatureBase):
             elif self.metric == "DCT Shannon Entropy":
                 new_data = img_contrast.fast_normalized_dct_shannon_entropy(img, 3)[0]
 
-            if len(self.plot_data) == self.n_steps:
-                self.process_data(coef, mode=self.fit_func)
-                self.trace_list[self.mode_names[self.change_coef[coef - 1]]] = {
-                    "x": self.x[coef - 1],
-                    "y": self.y,
-                    "x_fit": self.x_fit[coef - 1][::32],
-                    "y_fit": self.y_fit[::32],
-                }
-                out_str += "\tFITTING DATA...\n"
-
             self.plot_data.append(new_data)
             out_str += f"\tTrace:\t{np.flip(self.plot_data)}\n"
 
@@ -609,19 +616,29 @@ class TonyWilson(FeatureBase):
                 f"*** TonyWilson > in_func_data :: plot_data: {np.flip(self.plot_data)}"
             )
 
+            if len(self.plot_data) == self.n_steps:
+                self.process_data(self.f_coef, mode=self.fit_func)
+                self.trace_list[self.mode_names[self.change_coef[self.f_coef]]] = {
+                    "x": self.x[self.f_coef],
+                    "y": self.y,
+                    "x_fit": self.x_fit[self.f_coef][::32],
+                    "y_fit": self.y_fit[::32],
+                }
+                out_str += "\tFITTING DATA...\n"
+
             out_str += f"\tFrame Num:\t{self.frame_num}\n"
             if self.frame_num == 1:
                 self.frame_num = 10  # any value but not 1
                 return [self.target_frame_id]
 
-            if coef == self.n_coefs - 1:
-                if step == self.n_steps - 1:
+            if self.f_coef == self.n_coefs - 1:
+                if self.f_step == self.n_steps - 1:
 
                     self.coef_sweep *= 0.95
                     self.done_itr = True
-                    out_str += f"\tDone iteration {itr}!\n"
+                    out_str += f"\tDone iteration {self.f_itr}!\n"
 
-                    if itr == self.n_iter - 1:
+                    if self.f_itr == self.n_iter - 1:
                         self.done_all = True
                         out_str += "\tDone all!!!\n"
 
@@ -630,19 +647,23 @@ class TonyWilson(FeatureBase):
         if self.verbose:
             print(out_str)
         elif self.done_itr:
-            print(f"Done iteration {itr + 1} / {self.n_iter} ...")
+            print(f"Done iteration {self.f_itr + 1} / {self.n_iter} ...")
 
         if self.frames_done >= self.total_frame_num:
             return frame_ids
 
-    def build_report(self):
+    def build_report(self, achieved_coefs=None):
+
+        mirror_update = {
+            "mirror_img": self.mirror_img,
+            "coefs": self.best_coefs_overall,
+        }
+        if achieved_coefs is not None:
+            mirror_update["achieved_coefs"] = achieved_coefs
 
         return deepcopy(
             {
-                "mirror_update": {
-                    "mirror_img": self.mirror_img,
-                    "coefs": self.best_coefs,
-                },
+                "mirror_update": mirror_update,
                 "tonywilson": {
                     "peaks": self.best_peaks,
                     "trace": self.trace_list,
@@ -670,23 +691,39 @@ class TonyWilson(FeatureBase):
                 stop_time = time.time()
                 print(f"Total runtime:\t{(stop_time - self.start_time):.3f} sec")
             except Exception as e:
-                print(e)
+                self.model.logger.error(f"TonyWilson: failed to print runtime: {e}")
 
-        try:
-            if self.done_itr:
-                current_report = self.build_report()
+        if self.done_itr:
+            achieved_coefs = None
+            try:
+                self.mirror.display_modes(self.best_coefs_overall)
+                achieved_coefs = list(self.mirror.get_modal_coefs()[0])
+                diff = np.abs(self.best_coefs_overall - np.asarray(achieved_coefs))
+                mismatch = float(np.max(diff))
+                if mismatch > MODAL_APPROXIMATION_TOLERANCE:
+                    worst_mode_idx = int(np.argmax(diff))
+                    self.model.logger.warning(
+                        f"*** TonyWilson > end_func_data :: final-apply mismatch "
+                        f"{mismatch:.4f} at mode {worst_mode_idx}"
+                    )
+            except Exception as exc:
+                self.model.logger.error(
+                    f"TonyWilson: failed to re-display/read back best-known "
+                    f"correction: {exc}"
+                )
+
+            try:
+                current_report = self.build_report(achieved_coefs)
                 self.report.append(current_report)
 
                 self.model.event_queue.put(
                     ("mirror_update", current_report["mirror_update"])
                 )
                 self.model.event_queue.put(("tonywilson", current_report["tonywilson"]))
-        except Exception as e:
-            print(e)
+            except Exception as e:
+                self.model.logger.error(f"TonyWilson: failed to report progress: {e}")
 
         self.done_itr = False
-
-        self.mirror.display_modes(self.best_coefs_overall)
 
         if self.done_all and self.save_report:
             self.model.event_queue.put(("ao_save_report", self.report))

@@ -121,10 +121,12 @@ class AdaptiveOpticsPopupController(GUIController):
                 command=self.update_experiment_values
             )
             self.mode_labels[k].bind(
-                "<Enter>", lambda evt, mode=k: self.set_highlighted_mode(evt, mode)
+                "<Enter>", lambda evt, mode=k: self.set_highlighted_mode(
+                    evt, mode)
             )
             self.mode_labels[k].bind(
-                "<Leave>", lambda evt: evt.widget.config(background="SystemButtonFace")
+                "<Leave>", lambda evt: evt.widget.config(
+                    background="SystemButtonFace")
             )
 
         # update all experiment values each time one is changed
@@ -136,9 +138,11 @@ class AdaptiveOpticsPopupController(GUIController):
         #             "<KeyRelease>", self.on_input_change
         #         )
 
-        self.widgets["iterations"].widget.bind("<KeyRelease>", self.on_input_change)
+        self.widgets["iterations"].widget.bind(
+            "<KeyRelease>", self.on_input_change)
         self.widgets["steps"].widget.bind("<KeyRelease>", self.on_input_change)
-        self.widgets["amplitude"].widget.bind("<KeyRelease>", self.on_input_change)
+        self.widgets["amplitude"].widget.bind(
+            "<KeyRelease>", self.on_input_change)
 
         self.widgets["from"]["button"].bind(
             "<<ComboboxSelected>>", self.on_input_change
@@ -229,9 +233,11 @@ class AdaptiveOpticsPopupController(GUIController):
         self.mirror_params["modes"] = modes_dict
 
         try:
-            self.tw_params["iterations"] = int(self.widgets["iterations"].get())
+            self.tw_params["iterations"] = int(
+                self.widgets["iterations"].get())
             self.tw_params["steps"] = int(self.widgets["steps"].get())
-            self.tw_params["amplitude"] = float(self.widgets["amplitude"].get())
+            self.tw_params["amplitude"] = float(
+                self.widgets["amplitude"].get())
             self.tw_params["from"] = self.widgets["from"]["variable"].get()
             self.tw_params["metric"] = self.widgets["metric"]["variable"].get()
             self.tw_params["fitfunc"] = self.widgets["fitfunc"]["variable"].get()
@@ -395,8 +401,9 @@ class AdaptiveOpticsPopupController(GUIController):
         try:
             coefs = data["coefs"]
             self.set_widgets_from_coef(coefs)
+            achieved_coefs = data.get("achieved_coefs", coefs)
             self.coefs_bar.clear()
-            self.coefs_bar.bar(range(len(coefs)), coefs)
+            self.coefs_bar.bar(range(len(achieved_coefs)), achieved_coefs)
             self.coefs_bar.set_title("Current Coefs")
             self.coefs_bar.set_xlabel("coef")
             self.coefs_bar.set_ylabel("amplitude")

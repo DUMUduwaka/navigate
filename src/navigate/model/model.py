@@ -885,11 +885,19 @@ class Model:
         elif flatten:
             self.active_microscope.mirror.flat()
 
-        coef = list(self.active_microscope.mirror.get_modal_coefs()[0])
-        mirror_img = self.active_microscope.mirror.mirror_controller.get_wavefront_pix()
+        achieved = list(self.active_microscope.mirror.get_modal_coefs()[0])
+        commanded = list(coef) if coef else [0.0] * len(achieved)
+        mirror_img = self.active_microscope.mirror.get_wavefront_pix()
 
         self.event_queue.put(
-            ("mirror_update", {"mirror_img": mirror_img, "coefs": coef})
+            (
+                "mirror_update",
+                {
+                    "mirror_img": mirror_img,
+                    "coefs": commanded,
+                    "achieved_coefs": achieved,
+                },
+            )
         )
 
         # print(self.configuration['experiment']['MirrorParameters']['modes'])
