@@ -271,6 +271,8 @@ class AdaptiveOpticsPopupController(GUIController):
         coef : list
             The coefficients
         """
+        # An empty coef (e.g. from Flat, which commands nothing) deliberately
+        # leaves the entries unchanged, so Set can re-apply the last values.
         if list(coef):
             self.view.set_widgets(coef)
             self.update_experiment_values()

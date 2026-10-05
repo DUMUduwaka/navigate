@@ -728,7 +728,10 @@ def test_update_mirror_separates_commanded_from_achieved_coefs():
     )
 
 
-def test_update_mirror_flatten_reports_zero_commanded():
+def test_update_mirror_flatten_keeps_gui_coefs():
+    """Flatten must not report a zeroed commanded array -- an empty "coefs"
+    tells the GUI to leave its mode entries alone, so a later Set can
+    re-apply whatever correction was showing before the flatten."""
     from navigate.model.model import Model
 
     mirror = MagicMock()
@@ -748,7 +751,7 @@ def test_update_mirror_flatten_reports_zero_commanded():
             "mirror_update",
             {
                 "mirror_img": "IMG",
-                "coefs": [0.0, 0.0, 0.0],
+                "coefs": [],
                 "achieved_coefs": [0.01, -0.02, 0.0],
             },
         )

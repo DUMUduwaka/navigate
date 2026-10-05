@@ -873,6 +873,15 @@ class Model:
     def update_mirror(self, coef: list = [], flatten: bool = False) -> None:
         """Update the mirror.
 
+        Puts a "mirror_update" event on the event queue with:
+            coefs : list
+                Commanded coefficients -- empty when nothing new was
+                commanded (e.g. a flatten), which tells the GUI to leave its
+                current mode entries alone so "Set" can re-apply them.
+            achieved_coefs : list
+                Device readback (via get_modal_coefs()) of what the mirror
+                actually reached, reported regardless of what was commanded.
+
         Parameters
         ----------
         coef : list
@@ -886,7 +895,9 @@ class Model:
             self.active_microscope.mirror.flat()
 
         achieved = list(self.active_microscope.mirror.get_modal_coefs()[0])
-        commanded = list(coef) if coef else [0.0] * len(achieved)
+        # Empty "coefs" means nothing new was commanded (e.g. Flat): the GUI
+        # keeps its current mode entries so "Set" can re-apply them.
+        commanded = list(coef) if coef else []
         mirror_img = self.active_microscope.mirror.get_wavefront_pix()
 
         self.event_queue.put(
