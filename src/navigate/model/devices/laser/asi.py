@@ -32,7 +32,7 @@
 
 #  Standard Library Imports
 import logging
-from typing import Any
+from typing import Any, Union
 
 # Third Party Imports
 
@@ -108,11 +108,11 @@ class ASILaser(LaserBase, SerialDevice):
             digital = digital.upper()
 
         # Determine modulation type
-        if analog == "ASI" and digital == "ASI":
+        if self._is_asi_type(analog) and self._is_asi_type(digital):
             modulation_type = "mixed"
-        elif analog == "ASI":
+        elif self._is_asi_type(analog):
             modulation_type = "analog"
-        elif digital == "ASI":
+        elif self._is_asi_type(digital):
             modulation_type = "digital"
         else:
             raise ValueError("Laser modulation type not recognized.")
@@ -268,3 +268,22 @@ class ASILaser(LaserBase, SerialDevice):
     def __del__(self):
         """Destructor for the ASILaser class."""
         self.close()
+
+    def _is_asi_type(self, hardware_type: Union[str, None]) -> bool:
+        """Check if the hardware type is ASI type.
+
+        Parameters
+        ----------
+        hardware_type : Union[str, None]
+            The hardware type to check.
+
+        Returns
+        -------
+        bool
+            True if the hardware type is ASI type, False otherwise.
+        """
+        return (
+            hardware_type
+            and isinstance(hardware_type, str)
+            and hardware_type.lower() in ("asi", "asi.asi")
+        )

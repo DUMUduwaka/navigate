@@ -16,7 +16,10 @@ from navigate.config.preload import (
     _log_report,
     preload_configuration,
 )
-from navigate.config.preload_rules.configuration import _default_reference_value
+from navigate.config.preload_rules.configuration import (
+    _allows_structured_setting_value,
+    _default_reference_value,
+)
 from navigate.config.preload_rules.positions import validate_positions
 from navigate.config.configuration_schema import SettingSpec
 
@@ -55,6 +58,17 @@ def test_preload_warning_and_fatal_logs_are_wrapped_with_separators(caplog):
         f"{separator}\nPreload issue fatal.path: fatal message\n{separator}"
         in caplog.text
     )
+
+
+def test_preload_allows_stage_list_backed_text_settings():
+    """Stage list settings are valid structured values for legacy text fields."""
+    for name in (
+        "axes",
+        "axes_mapping",
+        "feedback_alignment",
+        "joystick_axes",
+    ):
+        assert _allows_structured_setting_value(name, ["x"])
 
 
 def test_preload_keeps_loaded_sections_as_shared_dicts(loaded_configuration):
@@ -962,6 +976,27 @@ def test_preload_normalizes_device_types_before_reference_check(loaded_configura
     assert microscope["camera"]["hardware"]["type"] == "hamamatsu.HamamatsuOrca"
     assert microscope["zoom"]["hardware"]["type"] == "synthetic.Synthetic"
     assert microscope["galvo"][0]["hardware"]["type"] == "ni.NI"
+    assert any(change.rule == "device-type-normalized" for change in report.changes)
+
+
+@pytest.mark.parametrize(
+    "raw_type,expected",
+    [
+        ("ni.NI", "NI"),
+        ("asi.ASI", "ASI"),
+        ("synthetic.Synthetic", "Synthetic"),
+    ],
+)
+def test_preload_normalizes_prefixed_daq_type_to_startup_token(
+    loaded_configuration, raw_type, expected
+):
+    manager, configuration = loaded_configuration
+    microscope = configuration["configuration"]["microscopes"]["Mesoscale"]
+    microscope["daq"]["hardware"]["type"] = raw_type
+
+    report = preload_configuration(manager, configuration)
+
+    assert microscope["daq"]["hardware"]["type"] == expected
     assert any(change.rule == "device-type-normalized" for change in report.changes)
 
 

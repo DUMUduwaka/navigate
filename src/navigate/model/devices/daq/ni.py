@@ -84,7 +84,7 @@ class NIDAQ(DAQBase):
         ),
         "laser_port_switcher": SettingSpec(
             str,
-            default="PXI6733/port0/line0",
+            default="",
             label="Laser Port Switcher",
             help_text="Digital output line used to switch laser ports.",
             required=False,

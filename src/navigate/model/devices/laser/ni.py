@@ -33,7 +33,7 @@
 # Standard Library Imports
 import logging
 import traceback
-from typing import Any
+from typing import Any, Union
 
 # Third Party Imports
 import nidaqmx
@@ -103,11 +103,11 @@ class NILaser(LaserBase, NIDevice):
             "laser"
         ][device_id]["onoff"]["hardware"].get("type", None)
 
-        if analog == "NI" and digital == "NI":
+        if self._is_ni_type(analog) and self._is_ni_type(digital):
             modulation_type = "mixed"
-        elif analog == "NI":
+        elif self._is_ni_type(analog):
             modulation_type = "analog"
-        elif digital == "NI":
+        elif self._is_ni_type(digital):
             modulation_type = "digital"
         else:
             raise ValueError("Laser modulation type not recognized.")
@@ -286,3 +286,22 @@ class NILaser(LaserBase, NIDevice):
                 self.laser_do_task.close()
             except Exception:
                 logger.exception(f"Error stopping task: {traceback.format_exc()}")
+
+    def _is_ni_type(self, hardware_type: Union[str, None]) -> bool:
+        """Check if the hardware type is NI type.
+
+        Parameters
+        ----------
+        hardware_type : Union[str, None]
+            The hardware type to check.
+
+        Returns
+        -------
+        bool
+            True if the hardware type is NI type, False otherwise.
+        """
+        return (
+            hardware_type
+            and isinstance(hardware_type, str)
+            and hardware_type.lower() in ("ni", "ni.ni")
+        )

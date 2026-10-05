@@ -46,6 +46,9 @@ from typing import Any, Callable, TypeVar
 from navigate.view.main_application_window import MainApp as view
 from navigate.view.popups.camera_view_popup_window import CameraViewPopupWindow
 from navigate.view.popups.feature_list_popup import FeatureListPopup
+from navigate.view.popups.resolution_change_popup import (
+    ResolutionChangeCancelledPopup,
+)
 from navigate.view.theme import apply_theme
 
 # Local Sub-Controller Imports
@@ -276,8 +279,19 @@ class Controller:
 
         #: dict: Event listeners for the controller.
         self.event_listeners = {
-            "autofocus_complete": self.autofocus_calibration_controller.handle_autofocus_complete
+            "autofocus_complete": (
+                self.autofocus_calibration_controller.handle_autofocus_complete
+            )
         }
+
+        #: Optional[int]: resolution-change task awaiting a recovery choice.
+        self._resolution_recovery_task_id = None
+
+        #: Optional[int]: last completed resolution-change task id.
+        self._last_completed_resolution_task_id = None
+
+        #: Optional[ResolutionChangeCancelledPopup]: active recovery dialog.
+        self._resolution_change_popup = None
 
         #: AcquireBarController: Acquire Bar Sub-Controller.
         self.acquire_bar_controller = AcquireBarController(self.view.acquire_bar, self)
@@ -1240,11 +1254,10 @@ class Controller:
                 return
 
             self.change_microscope(temp[0], temp[1])
-            work_thread = self.threads_pool.createThread(
+            self.threads_pool.createThread(
                 resourceName="model",
                 target=lambda: self.model.run_command("update_setting", "resolution"),
             )
-            work_thread.join()
 
         elif command == "set_save":
             """Set whether the image will be saved.
@@ -1869,7 +1882,118 @@ class Controller:
         -------
         None
         """
-        self.model.stop_stage()
+        while True:
+            try:
+                self.model.stop_stage()
+                return
+            except RuntimeError as e:
+                if "ObjectInSubprocess at the same time" not in str(e):
+                    raise
+                # ObjectInSubprocess rejects concurrent proxy calls. A safety stop
+                # must be retried instead of disappearing in the thread pool.
+                time.sleep(0.001)
+
+    def _show_resolution_change_cancelled(self, payload: dict[str, Any]) -> None:
+        """Show one recovery dialog for a cancelled resolution-change task.
+
+        Parameters
+        ----------
+        payload : dict[str, Any]
+            Cancellation event containing the task identifier and whether a
+            validated pre-movement position is available.
+
+        Returns
+        -------
+        None
+        """
+        task_id = payload["task_id"]
+        if self._resolution_recovery_task_id == task_id:
+            return
+
+        if self._last_completed_resolution_task_id == task_id:
+            return
+
+        if self._resolution_change_popup is not None:
+            try:
+                self._resolution_change_popup.popup.dismiss()
+            except tkinter.TclError:
+                pass
+
+        self._resolution_recovery_task_id = task_id
+        self._resolution_change_popup = ResolutionChangeCancelledPopup(
+            root=self.view.root,
+            keep_command=lambda: self._keep_resolution_position(task_id),
+            return_command=lambda: self._return_resolution_position(task_id),
+            return_enabled=bool(payload.get("return_allowed", False)),
+        )
+
+    def _keep_resolution_position(self, task_id: int) -> None:
+        """Accept the stopped stage position without further movement.
+
+        Parameters
+        ----------
+        task_id : int
+            Resolution-change task whose recovery choice is being resolved.
+
+        Returns
+        -------
+        None
+        """
+        if self._resolution_recovery_task_id != task_id:
+            return
+        self._resolution_change_popup = None
+        self._resolution_recovery_task_id = None
+        self.threads_pool.createThread(
+            resourceName="model",
+            target=lambda: self.model.run_command(
+                "resolution_recovery", task_id, "keep"
+            ),
+        )
+
+    def _return_resolution_position(self, task_id: int) -> None:
+        """Start a separately cancellable return to the saved stage position.
+
+        Parameters
+        ----------
+        task_id : int
+            Resolution-change task whose recovery choice is being resolved.
+
+        Returns
+        -------
+        None
+        """
+        if self._resolution_recovery_task_id != task_id:
+            return
+        self._resolution_change_popup = None
+        # Disable ordinary moves during the return; Stop Stage remains available.
+        self.stage_controller.view.toggle_button_states(
+            True, self.stage_controller.stage_axes
+        )
+        self.threads_pool.createThread(
+            resourceName="model",
+            target=lambda: self.model.run_command(
+                "resolution_recovery", task_id, "return"
+            ),
+        )
+
+    def _finish_resolution_return(self, payload: dict[str, Any]) -> None:
+        """Restore stage controls when return motion reaches a terminal state.
+
+        Parameters
+        ----------
+        payload : dict[str, Any]
+            Completion event containing the original resolution-change task id.
+
+        Returns
+        -------
+        None
+        """
+        if payload.get("task_id") != self._resolution_recovery_task_id:
+            return
+        self._last_completed_resolution_task_id = self._resolution_recovery_task_id
+        self.stage_controller.force_enable_all_axes()
+        self._resolution_change_popup = None
+        self._resolution_recovery_task_id = None
 
     def update_stage_limits(self, microscope_name: str) -> None:
         """Update stage limits on the device side
@@ -2004,6 +2128,12 @@ class Controller:
             elif event == "autofocus_sequence_complete":
                 self._set_autofocus_state(False)
 
+            elif event == "resolution_change_cancelled":
+                self._show_resolution_change_cancelled(value)
+
+            elif event == "resolution_return_complete":
+                self._finish_resolution_return(value)
+
             elif event in self.event_listeners.keys():
                 try:
                     self.event_listeners[event](value)
@@ -2069,12 +2199,14 @@ class Controller:
 
     def _restore_camera_trigger_setting(self):
         """Restore the camera trigger setting."""
-        for microscope_name in self.configuration.get("experiment", {}).get(
-            "CameraParameters", {}
+        for microscope_name in (
+            self.configuration.get("configuration", {}).get("microscopes", {}).keys()
         ):
             if (
                 "trigger_source_backup"
-                in self.configuration["experiment"]["CameraParameters"][microscope_name]
+                in self.configuration["experiment"]["CameraParameters"][
+                    microscope_name
+                ].keys()
             ):
                 if (
                     self.configuration["experiment"]["CameraParameters"][

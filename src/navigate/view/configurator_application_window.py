@@ -32,6 +32,7 @@
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional
+from pathlib import Path
 
 # Local Imports
 from navigate.view.theme import (
@@ -46,12 +47,20 @@ class ConfigurationAssistantWindow(ttk.Frame):
 
     def __init__(self, root: tk.Tk, *args, **kwargs) -> None:
         self.root = root
-        self.root.title("New Configuration Assistant")
+        self.root.title("Navigate Configuration Assistant")
         window_width, window_height = 1100, 720
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         position_x = max(0, (screen_width - window_width) // 2)
         position_y = max(0, (screen_height - window_height) // 2)
+
+        # keep icons relative to view directory structure
+        view_directory = Path(__file__).resolve().parent
+        try:
+            photo_image = view_directory.joinpath("icon", "mic.png")
+            self.root.iconphoto(True, tk.PhotoImage(file=photo_image))
+        except tk.TclError:
+            pass
         self.root.geometry(f"{window_width}x{window_height}+{position_x}+{position_y}")
         self.root.minsize(800, 500)
         self.root.rowconfigure(0, weight=1)
@@ -207,7 +216,7 @@ class DeviceInfoFrame(ttk.LabelFrame):
             row=2,
             column=0,
             sticky=tk.NSEW,
-            padx=get_theme_space_px(3),
+            padx=get_theme_padding_px((3, 0)),
             pady=get_theme_padding_px((0, 3)),
         )
         self.settings_frame = ttk.Frame(self.settings_canvas)
@@ -215,6 +224,14 @@ class DeviceInfoFrame(ttk.LabelFrame):
         self.settings_frame.columnconfigure(1, weight=1, minsize=160)
         self.settings_window = self.settings_canvas.create_window(
             (0, 0), anchor=tk.NW, window=self.settings_frame
+        )
+        self.vertical_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL)
+        self.vertical_scrollbar.grid(
+            row=2,
+            column=1,
+            sticky=tk.NS,
+            padx=get_theme_padding_px((0, 3)),
+            pady=get_theme_padding_px((0, 3)),
         )
         self.horizontal_scrollbar = ttk.Scrollbar(self, orient=tk.HORIZONTAL)
         self.horizontal_scrollbar.grid(
