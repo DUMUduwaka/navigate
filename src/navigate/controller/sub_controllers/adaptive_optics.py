@@ -110,8 +110,8 @@ class AdaptiveOpticsPopupController(GUIController):
         self.view.flat_button.configure(command=self.flatten_mirror)
         self.view.zero_button.configure(command=self.zero_mirror)
         self.view.clear_button.configure(command=self.clear_all_coefs)
-        self.view.save_wcs_button.configure(command=self.save_wcs_file)
-        self.view.from_wcs_button.configure(command=self.set_from_wcs_file)
+        self.view.save_button.configure(command=self.save_ao_file)
+        self.view.load_button.configure(command=self.load_ao_file)
         self.view.select_all_modes.configure(command=self.select_all_modes)
         self.view.deselect_all_modes.configure(command=self.deselect_all_modes)
         self.view.tony_wilson_button.configure(command=self.run_tony_wilson)
@@ -282,25 +282,47 @@ class AdaptiveOpticsPopupController(GUIController):
         self.update_experiment_values()
         self.parent_controller.execute("set_mirror")
 
-    def save_wcs_file(self):
-        """Save the wcs file"""
-        wcs_path = filedialog.asksaveasfilename(
-            defaultextension=".wcs",
-            initialdir="E:\\WaveKitX64\\MirrorFiles",
-            filetypes=[("Wavefront File", "*.wcs")],
-        )
+    def save_ao_file(self):
+        """Save the current adaptive-optics correction to file."""
+        if self.view.mirror_manufacturer == "dpp":
+            path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                initialdir="D:\\Phaseform\\PhasePlate_files",
+                filetypes=[("JSON File", "*.json")],
+            )
+            if not path:
+                return
+            self.parent_controller.execute("save_json_file", path)
+        else:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".wcs",
+                initialdir="E:\\WaveKitX64\\MirrorFiles",
+                filetypes=[("Wavefront File", "*.wcs")],
+            )
+            if not path:
+                return
+            self.parent_controller.execute("save_wcs_file", path)
 
-        self.parent_controller.execute("save_wcs_file", wcs_path)
-
-    def set_from_wcs_file(self):
-        """Set the mirror from the wcs file"""
-        wcs_path = filedialog.askopenfilename(
-            defaultextension=".wcs",
-            initialdir="E:\\WaveKitX64\\MirrorFiles",
-            filetypes=[("Wavefront File", "*.wcs")],
-        )
-
-        self.parent_controller.execute("set_mirror_from_wcs", wcs_path)
+    def load_ao_file(self):
+        """Load a saved adaptive-optics correction from file."""
+        if self.view.mirror_manufacturer == "dpp":
+            path = filedialog.askopenfilename(
+                defaultextension=".json",
+                initialdir="D:\\Phaseform\\PhasePlate_files",
+                filetypes=[("JSON File", "*.json")],
+            )
+            if not path:
+                return
+            self.parent_controller.execute("set_mirror_from_json", path)
+        else:
+            path = filedialog.askopenfilename(
+                defaultextension=".wcs",
+                initialdir="E:\\WaveKitX64\\MirrorFiles",
+                filetypes=[("Wavefront File", "*.wcs")],
+            )
+            if not path:
+                return
+            self.parent_controller.execute("set_mirror_from_wcs", path)
 
     def run_tony_wilson(self):
         """Run the tony wilson routine"""

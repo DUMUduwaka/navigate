@@ -82,6 +82,7 @@ from navigate.model.resolution_change import (
     _ResolutionChangeTask,
     _ResolutionRecovery,
 )
+from navigate.model.devices import adaptive_optics_modes
 from navigate.config.config import get_navigate_path
 from navigate.model.plugins_model import PluginsModel
 
@@ -744,6 +745,15 @@ class Model:
             self.active_microscope.mirror.save_wcs_file(path=args[0])
         elif command == "set_mirror_from_wcs":
             coefficients = self.active_microscope.mirror.set_from_wcs_file(path=args[0])
+            self.update_mirror(coef=coefficients)
+        elif command == "save_json_file":
+            self.active_microscope.mirror.save_json_file(path=args[0])
+        elif command == "set_mirror_from_json":
+            sparse = self.active_microscope.mirror.set_from_json_file(path=args[0])
+            coefficients = [
+                sparse.get(i + 1, 0.0)
+                for i in range(adaptive_optics_modes.DEFAULT_N_MODES)
+            ]
             self.update_mirror(coef=coefficients)
         elif command == "tony_wilson":
             # tony_wilson = TonyWilson(self)

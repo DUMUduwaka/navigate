@@ -582,6 +582,7 @@ zoom_hardware_widgets = {
 
 mirror_device_types = {
     "Imagine Optics": ("ImagineOptics", "imop"),
+    "Phaseform DPP": ("PhaseformDPP", "dpp"),
     "Virtual Device": ("Synthetic", "synthetic"),
 }
 
