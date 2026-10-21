@@ -745,6 +745,13 @@ class Model:
         elif command == "set_mirror_from_wcs":
             coefficients = self.active_microscope.mirror.set_from_wcs_file(path=args[0])
             self.update_mirror(coef=coefficients)
+        elif command == "save_json_file":
+            self.active_microscope.mirror.save_json_file(path=args[0])
+        elif command == "set_mirror_from_json":
+            coefficients = self.active_microscope.mirror.set_from_json_file(
+                path=args[0]
+            )
+            self.update_mirror(coef=coefficients)
         elif command == "tony_wilson":
             # tony_wilson = TonyWilson(self)
             # tony_wilson.run(*args)

@@ -332,6 +332,23 @@ class TonyWilson(FeatureBase):
             )
             self.best_coefs = np.asarray(curr_expt_coefs, dtype=np.float32)
 
+        # Per-mode sweep scale: 1.0 unless the mirror reports amplitude limits
+        # (Phaseform DPP); then each sweep stays within that mode's range.
+        self.sweep_scale = np.ones(self.n_coefs, dtype=np.float32)
+        try:  # mirrors without amplitude limits (e.g. Imagine Optics) raise here
+            pos_lim, neg_lim = self.mirror_controller.get_amplitude_limits()
+        except (AttributeError, TypeError, ValueError):
+            pos_lim = neg_lim = None
+        if pos_lim is not None and self.coef_amp > 0:
+            for j, c in enumerate(self.change_coef):
+                room = min(
+                    pos_lim[c] - self.best_coefs[c], self.best_coefs[c] - neg_lim[c]
+                )
+                self.sweep_scale[j] = np.clip(room / self.coef_amp, 0.1, 1.0)
+            self.model.logger.info(
+                f"TonyWilson sweep scale per mode: {self.sweep_scale}"
+            )
+
         self.best_coefs_overall = deepcopy(self.best_coefs)
         self.best_metric = 0.0
         self.best_peaks = []
@@ -358,7 +375,7 @@ class TonyWilson(FeatureBase):
 
         coef_arr = np.zeros(self.n_modes, dtype=np.float32)
         c = self.change_coef[coef]
-        coef_arr[c] = self.coef_sweep[step]
+        coef_arr[c] = self.coef_sweep[step] * self.sweep_scale[coef]
 
         applied_coefs = coef_arr + self.best_coefs
 
@@ -489,7 +506,7 @@ class TonyWilson(FeatureBase):
             r_2 = r_squared(self.y, gauss(self.x, p[0], p[1], p[2], p[3]))
 
         self.best_coefs[self.change_coef[coef - 1]] += (
-            self.x_fit[self.y_fit.argmax()] * r_2
+            self.x_fit[self.y_fit.argmax()] * r_2 * self.sweep_scale[coef - 1]
         )  # weight by R^2 goodness of fit
         self.mirror_img = self.mirror_controller.get_wavefront_pix()
 

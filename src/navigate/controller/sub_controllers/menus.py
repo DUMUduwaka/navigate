@@ -1049,7 +1049,9 @@ class MenuController(GUIController):
         if hasattr(self.parent_controller, "adaptiveoptics_popup_controller"):
             self.parent_controller.ao_popup_controller.showup()
             return
-        ao_popup = AdaptiveOpticsPopup(self.view)
+        ao_popup = AdaptiveOpticsPopup(
+            self.view, configuration=self.parent_controller.configuration
+        )
         self.parent_controller.ao_popup_controller = AdaptiveOpticsPopupController(
             ao_popup, self.parent_controller
         )
