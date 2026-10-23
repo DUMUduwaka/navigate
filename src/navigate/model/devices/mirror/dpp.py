@@ -72,11 +72,25 @@ class PhaseformDPPMirror(MirrorBase, IntegratedDevice):
         ),
         "hardware/max_voltage": SettingSpec(
             int,
-            default=300,
             label="Max Voltage",
-            help_text="Maximum drive voltage of the phase plate (100-300 V).",
-            minimum=100,
+            help_text=(
+                "Optional maximum drive voltage of the phase plate (V). Leave "
+                "unset to use the calibration file's maximum. Must be within the "
+                "range the calibration allows (logged at startup)."
+            ),
+            minimum=50,
             maximum=300,
+            required=False,
+        ),
+        "hardware/settle_time_ms": SettingSpec(
+            int,
+            label="Settle Time (ms)",
+            help_text=(
+                "Optional wait after each mirror write before the camera exposes. "
+                "Leave unset for the default of 65 ms."
+            ),
+            minimum=0,
+            maximum=1000,
             required=False,
         ),
     }
@@ -137,16 +151,20 @@ class PhaseformDPPMirror(MirrorBase, IntegratedDevice):
         # obj: mirror controller (PhaseformDPP)
         self.mirror_controller = device_connection
 
-        # Optional max drive voltage ("max_voltage" in the hardware config).
+        # Optional settings in the hardware config: max drive voltage (default:
+        # the calibration's maximum) and settle time after each write.
         hardware_config = configuration["configuration"]["microscopes"][
             microscope_name
         ]["mirror"]["hardware"]
         max_voltage = hardware_config.get("max_voltage", None)
         if (
             max_voltage is not None
-            and int(max_voltage) != self.mirror_controller.max_voltage
+            and int(max_voltage) != self.mirror_controller.get_max_voltage()
         ):
             self.mirror_controller.set_max_voltage(int(max_voltage))
+        settle_time_ms = hardware_config.get("settle_time_ms", None)
+        if settle_time_ms is not None:
+            self.mirror_controller.set_settle_time(int(settle_time_ms))
 
         logger.info("PhaseformDPPMirror Initialized")
 

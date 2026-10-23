@@ -60,6 +60,12 @@ class FakeSDK:
     def __init__(self):
         self.calls = []
         self.max_voltage = self.maxV
+        self.save_volts_flag = True
+        self.dpp_ctrl_opened = False
+        self.zernike_amplitudes = [0.0] * 36
+        self.drop_command = False
+        self.solver_fails = False
+        self.device_handle = None
         self.influence_matrix = np.zeros((36, 63))
         self.corrections_loaded = False
         self.approximated = [0.0] * 36
@@ -82,6 +88,8 @@ class FakeSDK:
 
     def connect_device(self, port_name):
         self.calls.append(("connect_device", port_name))
+        self.device_handle = object()
+        self.dpp_ctrl_opened = True
         return True
 
     def get_device_status(self):
@@ -108,7 +116,13 @@ class FakeSDK:
         self._enter()
         self.calls.append(("apply_phases", list(phases), calculate_only))
         padded = list(phases) + [0.0] * (36 - len(phases))
+        # The real SDK only prints and returns when it cannot parse the phases.
+        self.zernike_amplitudes = (
+            [0.0] * 36 if self.drop_command else [float(p) for p in padded]
+        )
         self.approximated = [round(float(p) * 0.9, 4) for p in padded]
+        # The real SDK sends 0 V on every channel when its solve fails.
+        self.voltages = np.zeros(63) if self.solver_fails else np.full(63, 135.0)
 
     def apply_flat_field(self):
         if self.fail is not None:
@@ -137,6 +151,7 @@ class FakeSDK:
 
     def close(self):
         self.calls.append(("close",))
+        self.device_handle = None  # the real SDK leaves dpp_ctrl_opened True
 
 
 @pytest.fixture(autouse=True)
@@ -175,9 +190,16 @@ def phaseplate(monkeypatch):
 
 @pytest.fixture
 def plate(phaseplate):
-    return phaseplate.PhaseformDPP(
-        port="COM_UNUSED", calibration_file_path="calibration.csv", connect=False
+    """A plate whose port counts as open, with no settle wait."""
+    plate = phaseplate.PhaseformDPP(
+        port="COM_UNUSED",
+        calibration_file_path="calibration.csv",
+        connect=False,
+        settle_time_ms=0,
     )
+    plate._is_connected = True
+    plate.dpp.dpp_ctrl_opened = True
+    return plate
 
 
 def applied_phases(sdk):
@@ -333,6 +355,49 @@ def test_connect_sets_max_voltage_after_loading_calibration(phaseplate):
     assert plate.dpp.max_voltage == 150
 
 
+def _calibration_capped_sdk(maximum):
+    """SDK whose calibration file caps the max voltage (a real one gave 290 V)."""
+
+    def make(verbose_debug_info=False):
+        sdk = FakeSDK()
+        sdk.maxV = maximum
+        return sdk
+
+    return make
+
+
+def test_connect_keeps_the_calibration_max_voltage_by_default(phaseplate, monkeypatch):
+    monkeypatch.setattr(
+        sys.modules["dpp_ctrl.api_dpp"], "initialize", _calibration_capped_sdk(290)
+    )
+
+    plate = phaseplate.PhaseformDPP(port="COM4", calibration_file_path="calib.json")
+
+    names = [c[0] for c in plate.dpp.calls]
+    assert "set_max_voltage" not in names
+    assert "close" not in names
+    assert plate.dpp.max_voltage == 290
+
+
+def test_rejected_max_voltage_fails_before_the_port_is_opened(
+    phaseplate, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        sys.modules["dpp_ctrl.api_dpp"], "initialize", _calibration_capped_sdk(290)
+    )
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="calib.json", max_voltage=300, connect=False
+    )
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(RuntimeError, match="rejected max voltage 300V"):
+        plate.connect()
+
+    assert "setup on port 'COM4' failed" in caplog.text
+    names = [c[0] for c in plate.dpp.calls]
+    assert "connect_device" not in names and "close" not in names
+
+
 def test_amplitude_limits_are_aligned_to_navigate_slots(phaseplate):
     plate = phaseplate.PhaseformDPP(port="COM4", calibration_file_path="calib.csv")
 
@@ -378,3 +443,177 @@ def test_command_outside_limits_logs_warning(phaseplate, caplog):
 
     assert "outside the achievable range for slot(s) [5]" in caplog.text
     assert (plate.get_modal_coefs()[0] == coefs).all()  # the command is still sent
+
+
+def test_bad_calibration_fails_before_the_port_is_opened(phaseplate, monkeypatch):
+    def broken_load(abs_path, operation_mode):
+        raise OSError("no such file")
+
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="missing.json", connect=False
+    )
+    monkeypatch.setattr(plate.dpp, "load_infl_matrix", broken_load)
+
+    with pytest.raises(RuntimeError, match="Could not load influence matrix"):
+        plate.connect()
+
+    names = [c[0] for c in plate.dpp.calls]
+    assert "connect_device" not in names and "close" not in names
+
+
+def test_connect_opens_the_port_after_loading_and_limits(phaseplate):
+    plate = phaseplate.PhaseformDPP(port="COM4", calibration_file_path="calib.json")
+
+    names = [c[0] for c in plate.dpp.calls]
+    assert (
+        names.index("load_infl_matrix")
+        < names.index("get_ampls_limits")
+        < names.index("connect_device")
+    )
+
+
+def test_status_failure_after_opening_closes_the_port(phaseplate, monkeypatch, caplog):
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="calib.json", connect=False
+    )
+
+    def broken_status():
+        raise OSError("write timeout")
+
+    monkeypatch.setattr(plate.dpp, "get_device_status", broken_status)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(OSError):
+        plate.connect()
+
+    assert ("close",) in plate.dpp.calls
+    assert "setup on port 'COM4' failed" in caplog.text
+
+
+def test_failed_connect_reports_the_sdk_output(phaseplate, monkeypatch):
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="calib.json", connect=False
+    )
+
+    def busy_port(port_name):
+        print("could not open port 'COM4': PermissionError")
+        return False
+
+    monkeypatch.setattr(plate.dpp, "connect_device", busy_port)
+
+    with pytest.raises(ConnectionError, match="PermissionError"):
+        plate.connect()
+
+
+def test_sdk_volts_cache_is_switched_off(plate):
+    assert plate.dpp.save_volts_flag is False
+
+
+def test_nothing_is_sent_when_the_port_is_closed(plate, caplog):
+    plate.display_modes(np.full(32, 0.1, dtype=np.float32))
+    plate.dpp.dpp_ctrl_opened = False
+    calls_before = len(plate.dpp.calls)
+    caplog.set_level(logging.ERROR)
+
+    plate.display_modes(np.full(32, 0.2, dtype=np.float32))
+    plate.flat()
+
+    assert len(plate.dpp.calls) == calls_before
+    assert plate.get_modal_coefs()[0] == pytest.approx([0.1] * 32)
+    assert "not connected; nothing was sent" in caplog.text
+
+
+def test_a_command_the_sdk_drops_keeps_the_previous_readback(plate, caplog):
+    plate.display_modes(np.full(32, 0.1, dtype=np.float32))
+    plate.dpp.drop_command = True
+    caplog.set_level(logging.ERROR)
+
+    plate.display_modes(np.full(32, 0.2, dtype=np.float32))
+
+    assert plate.get_modal_coefs()[0] == pytest.approx([0.1] * 32)
+    assert "did not accept the command" in caplog.text
+
+
+def test_non_finite_coefficients_are_not_sent(plate, caplog):
+    coefs = np.zeros(32)
+    coefs[3] = np.nan
+    calls_before = len(plate.dpp.calls)
+    caplog.set_level(logging.ERROR)
+
+    plate.display_modes(coefs)
+
+    assert len(plate.dpp.calls) == calls_before
+    assert "NaN or inf" in caplog.text
+
+
+def test_settle_wait_follows_each_real_write(phaseplate, monkeypatch):
+    plate = phaseplate.PhaseformDPP(port="COM4", calibration_file_path="calib.json")
+    waits = []
+    monkeypatch.setattr(phaseplate.time, "sleep", waits.append)
+
+    plate.display_modes(np.zeros(32, dtype=np.float32))
+    plate.flat()
+
+    assert plate.settle_time_ms == 65
+    # once, after display_modes only (the fake SDK itself sleeps 0.2 ms per call)
+    assert [w for w in waits if w >= 0.001] == [0.065]
+
+
+@pytest.mark.parametrize("bad", [-1, 1001])
+def test_settle_time_is_validated(plate, bad):
+    with pytest.raises(ValueError):
+        plate.set_settle_time(bad)
+
+
+def test_saturation_warning_is_rate_limited(phaseplate, caplog):
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="calib.json", settle_time_ms=0
+    )
+    coefs = np.zeros(32, dtype=np.float32)
+    coefs[5] = 2.0  # the fake model reproduces only 90%
+    caplog.set_level(logging.WARNING)
+
+    for _ in range(5):
+        plate.display_modes(coefs)
+
+    assert caplog.text.count("reproduces the command only to within") == 1
+    assert caplog.text.count("outside the achievable range") == 1
+
+
+def test_port_left_open_by_a_failed_connect_is_closed(phaseplate, monkeypatch):
+    plate = phaseplate.PhaseformDPP(
+        port="COM4", calibration_file_path="calib.json", connect=False
+    )
+
+    def opens_then_fails(port_name):
+        plate.dpp.device_handle = object()  # the port is open...
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad banner")
+
+    monkeypatch.setattr(plate.dpp, "connect_device", opens_then_fails)
+
+    with pytest.raises(ConnectionError):
+        plate.connect()
+
+    assert ("close",) in plate.dpp.calls
+    assert plate.dpp.device_handle is None
+
+
+def test_disconnect_clears_the_sdk_open_flag(phaseplate):
+    plate = phaseplate.PhaseformDPP(port="COM4", calibration_file_path="calib.json")
+    assert plate.dpp.dpp_ctrl_opened
+
+    plate.disconnect()
+
+    assert ("close",) in plate.dpp.calls
+    assert plate.dpp.dpp_ctrl_opened is False
+
+
+def test_failed_voltage_solve_keeps_the_previous_readback(plate, caplog):
+    plate.display_modes(np.full(32, 0.1, dtype=np.float32))
+    plate.dpp.solver_fails = True
+    caplog.set_level(logging.ERROR)
+
+    plate.display_modes(np.full(32, 0.2, dtype=np.float32))
+
+    assert plate.get_modal_coefs()[0] == pytest.approx([0.1] * 32)
+    assert "voltage solve failed" in caplog.text

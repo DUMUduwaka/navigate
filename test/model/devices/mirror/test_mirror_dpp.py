@@ -80,6 +80,12 @@ def dpp_module(monkeypatch):
             self.calls.append(("set_max_voltage", {"max_voltage": max_voltage}))
             self.max_voltage = max_voltage
 
+        def get_max_voltage(self):
+            return self.max_voltage
+
+        def set_settle_time(self, settle_time_ms):
+            self.calls.append(("set_settle_time", {"settle_time_ms": settle_time_ms}))
+
         def get_amplitude_limits(self):
             self.calls.append(("get_amplitude_limits", {}))
             return ([0.5] * 32, [-0.4] * 32)
@@ -173,6 +179,39 @@ def test_constructor_skips_max_voltage_equal_to_current(
     module.PhaseformDPPMirror("scope-a", controller, mirror_configuration)
 
     assert controller.calls == [("flat", {})]
+
+
+def test_constructor_compares_with_the_effective_max_voltage(
+    dpp_module, mirror_configuration
+):
+    """A configured value equal to the calibration's voltage is not re-applied."""
+    module, fake_class = dpp_module
+    controller = fake_class()
+    controller.max_voltage = 290  # set by the calibration file
+    hardware = mirror_configuration["configuration"]["microscopes"]["scope-a"][
+        "mirror"
+    ]["hardware"]
+    hardware["max_voltage"] = 290
+
+    module.PhaseformDPPMirror("scope-a", controller, mirror_configuration)
+
+    assert controller.calls == [("flat", {})]
+
+
+def test_constructor_applies_configured_settle_time(dpp_module, mirror_configuration):
+    module, fake_class = dpp_module
+    controller = fake_class()
+    hardware = mirror_configuration["configuration"]["microscopes"]["scope-a"][
+        "mirror"
+    ]["hardware"]
+    hardware["settle_time_ms"] = 20
+
+    module.PhaseformDPPMirror("scope-a", controller, mirror_configuration)
+
+    assert controller.calls == [
+        ("set_settle_time", {"settle_time_ms": 20}),
+        ("flat", {}),
+    ]
 
 
 def test_constructor_raises_for_unknown_microscope(

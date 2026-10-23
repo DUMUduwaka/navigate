@@ -2,10 +2,13 @@
 High-level controller for a Phaseform DPP phase plate
 """
 
+import contextlib
+import io
 import json
 import logging
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -25,6 +28,13 @@ except ImportError as err:
 # Logger Setup
 p = __name__.split(".")[1]
 logger = logging.getLogger(p)
+
+#: float: |achieved - commanded| (calibration units) above which a command is
+#: reported as not reproduced by the plate (saturation, or an unformable shape).
+ACHIEVED_TOLERANCE = 0.02
+
+#: float: minimum seconds between repeated warnings of the same kind.
+WARNING_INTERVAL_S = 5.0
 
 # Mode names are not in order that is compatible with the IMOP_Mirror class.
 # Define the max radial order of Zernike polynomials to include in the list of mode names.
@@ -50,11 +60,12 @@ class PhaseformDPP:
         port,
         calibration_file_path,
         operation_mode="v",
-        max_voltage=300,
+        max_voltage=None,
         print_debug_info=False,
         load_default=False,
         connect=True,
         n_modes=32,
+        settle_time_ms=65,
     ):
         """
         Connect to the DPP and load its influence-matrix/flat-field calibration.
@@ -74,7 +85,10 @@ class PhaseformDPP:
             influence matrix to load from the calibration file. Default "v".
 
         max_voltage : int, optional
-            Maximum drive voltage (100-300V), applied on every connect().
+            Maximum drive voltage in V, applied after the calibration on every
+            connect(). None (default) keeps the maximum the calibration file
+            sets when it loads. A value outside the range the calibration
+            allows raises.
 
         print_debug_info : bool, optional
             Forwarded to PyCtrlDPP for verbose serial/debug logging.
@@ -89,6 +103,12 @@ class PhaseformDPP:
         n_modes : int, optional
             Number of real Zernike modes (piston excluded) navigate commands.
             Slot i maps to OSA index i + 1. Default 32.
+
+        settle_time_ms : int, optional
+            Time to wait after each display_modes() write before returning, so
+            the next camera exposure sees the new shape. The SDK returns as
+            soon as the bytes are handed to the serial driver. Default 65 ms
+            (what Phaseform's own tests wait); 0-1000.
         """
         if not port:
             raise ValueError("Port must be provided.")
@@ -103,7 +123,15 @@ class PhaseformDPP:
         self.load_default = load_default
 
         self.dpp = api_dpp.initialize(verbose_debug_info=print_debug_info)
+        # Always solve fresh: the SDK's volts cache is keyed only by device ID,
+        # orientation and amplitudes (not max_voltage or calibration content),
+        # and it writes a pickle into site-packages. Must be off before loading.
+        self.dpp.save_volts_flag = False
         self._is_connected = False
+        self.set_settle_time(settle_time_ms)
+
+        #: dict: time of the last warning of each kind (rate limiting).
+        self._last_warning = {}
 
         if not 1 <= self.n_modes <= self.dpp.max_osa_index:
             raise ValueError(
@@ -125,106 +153,158 @@ class PhaseformDPP:
 
     def connect(self):
         """
-        Open the serial connection (if not already connected) and (re)load
-        calibration.
+        Load and check the calibration and the max voltage, compute the
+        amplitude limits (none of which needs the port), then open the serial
+        port if it is not open yet. Configuration errors therefore fail before
+        the port is opened and never reset the plate. (With load_default, the
+        port is opened first, as before.)
         """
         with self._lock:
-            if not self._is_connected:
-                try:
-                    connected = self.dpp.connect_device(port_name=self.port)
-                except Exception as err:
-                    raise ConnectionError(
-                        f"Could not open serial port '{self.port}' to connect to the DPP device. "
-                        "Check that the device is powered on, connected via USB/serial."
-                    ) from err
-
-                if not connected:
-                    raise ConnectionError(
-                        f"Serial port '{self.port}' opened, but the DPP device did not respond. "
-                        "Check that the device is not in use by another application and that the "
-                        "correct port is specified."
-                    )
-                self._is_connected = True
-                logger.info(f"Connected to DPP device on port '{self.port}'.")
-                self.dpp.get_device_status()
-
             try:
-                if self.load_default:
-                    try:
-                        calibration_files_loaded = self.dpp.load_precalibration(
-                            operation_mode=self.operation_mode
-                        )
-                        logger.info(
-                            f"Default calibrations files loaded: {calibration_files_loaded}"
-                        )
-
-                    except Exception as err:
-                        raise RuntimeError(
-                            f"Could not load precalibration from "
-                            f"'{self.operation_mode}'"
-                        ) from err
-
-                    if not calibration_files_loaded:
-                        raise RuntimeError(
-                            f"PyCtrlDPP.load_precalibration(operation_mode = '{self.operation_mode}') "
-                            "returned False and no valid default calibration was loaded."
-                        )
-
-                else:
-                    try:
-                        influence_matrix_loaded = self.dpp.load_infl_matrix(
-                            abs_path=self.calibration_file_path,
-                            operation_mode=self.operation_mode,
-                        )
-                        logger.info(
-                            f"Influence matrix loaded: {influence_matrix_loaded}"
-                        )
-
-                    except Exception as err:
-                        raise RuntimeError(
-                            f"Could not load influence matrix calibration from "
-                            f"'{self.calibration_file_path}' (orientation '{self.operation_mode}')"
-                        ) from err
-
-                    if not influence_matrix_loaded:
-                        raise RuntimeError(
-                            f"PyCtrlDPP.load_infl_matrix('{self.calibration_file_path}', "
-                            f"operation_mode = '{self.operation_mode}') returned False. "
-                            "No exception was raised, but the file wasn't loaded as a valid "
-                            "influence matrix."
-                        )
-
-                    if not self.dpp.corrections_loaded:
-                        try:
-                            flat_field_loaded = self.dpp.load_flat_field(
-                                abs_path=self.calibration_file_path,
-                                operation_mode=self.operation_mode,
-                            )
-                            logger.info(f"Flat offsets loaded: {flat_field_loaded}")
-
-                        except Exception as err:
-                            raise RuntimeError(
-                                f"Could not load flat field offsets from "
-                                f"'{self.calibration_file_path}' (orientation "
-                                f"'{self.operation_mode}')."
-                            ) from err
-
-                        if not flat_field_loaded:
-                            raise RuntimeError(
-                                f"PyCtrlDPP.load_flat_field(abs_path='{self.calibration_file_path}', "
-                                f"operation_mode='{self.operation_mode}') returned False. No exception "
-                                "was raised but no valid flat field offsets were loaded. "
-                            )
-
-                # Loading an influence matrix resets the SDK's max voltage to its
-                # default, so the max voltage is applied after the calibration.
-                if self.max_voltage is not None:
-                    self._apply_max_voltage(self.max_voltage)
-            except Exception:
+                if self.load_default and not self._is_connected:
+                    # Phaseform's bundled calibration may depend on the device.
+                    self._open_port()
+                self._load_calibration()
+                self._compute_amplitude_limits()
+                if not self._is_connected:
+                    self._open_port()
+            except Exception as err:
+                # auto_redial only logs retries at DEBUG level, so report the
+                # real cause here (closing an open port resets the plate).
+                logger.error(f"PhaseformDPP: setup on port '{self.port}' failed: {err}")
                 self.disconnect()
                 raise
 
-            self._compute_amplitude_limits()
+    def _open_port(self):
+        """Open the serial port and query the device status.
+
+        The SDK reports connection problems only by printing, so its output is
+        captured, logged, and included in the error.
+        """
+        try:
+            connected, output = self._call_logging_output(
+                self.dpp.connect_device, port_name=self.port
+            )
+        except Exception as err:
+            raise ConnectionError(
+                f"Could not open serial port '{self.port}' for the DPP. Check that "
+                "the device is powered on and connected."
+            ) from err
+
+        if not connected:
+            raise ConnectionError(
+                f"The DPP did not connect on '{self.port}'. Check the port name, "
+                "that the device is powered on, and that no other program (e.g. "
+                f"Phaseform's GUI) is using it. SDK output: {self._one_line(output)}"
+            )
+        self._is_connected = True
+        logger.info(f"Connected to DPP device on port '{self.port}'.")
+        self._call_logging_output(self.dpp.get_device_status)
+
+    @staticmethod
+    def _one_line(text, limit=500):
+        """Collapse multi-line SDK output for an error message."""
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return (" | ".join(lines)[-limit:]) if lines else "none"
+
+    @staticmethod
+    def _call_logging_output(func, *args, **kwargs):
+        """Call an SDK function and log what it prints to stdout.
+
+        Returns
+        -------
+        tuple
+            (return value, printed text)
+        """
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                result = func(*args, **kwargs)
+        finally:
+            output = buffer.getvalue().strip()
+            if output:
+                logger.info(f"PhaseformDPP SDK output:\n{output}")
+        return result, output
+
+    def _load_calibration(self):
+        """Load the influence matrix and flat offsets, then the max voltage.
+
+        Works without an open port. Raises RuntimeError if anything is invalid.
+        """
+        if self.load_default:
+            try:
+                calibration_files_loaded = self.dpp.load_precalibration(
+                    operation_mode=self.operation_mode
+                )
+                logger.info(
+                    f"Default calibrations files loaded: {calibration_files_loaded}"
+                )
+
+            except Exception as err:
+                raise RuntimeError(
+                    f"Could not load precalibration from '{self.operation_mode}'"
+                ) from err
+
+            if not calibration_files_loaded:
+                raise RuntimeError(
+                    f"PyCtrlDPP.load_precalibration(operation_mode = '{self.operation_mode}') "
+                    "returned False and no valid default calibration was loaded."
+                )
+
+        else:
+            try:
+                influence_matrix_loaded = self.dpp.load_infl_matrix(
+                    abs_path=self.calibration_file_path,
+                    operation_mode=self.operation_mode,
+                )
+                logger.info(f"Influence matrix loaded: {influence_matrix_loaded}")
+
+            except Exception as err:
+                raise RuntimeError(
+                    f"Could not load influence matrix calibration from "
+                    f"'{self.calibration_file_path}' (orientation '{self.operation_mode}')"
+                ) from err
+
+            if not influence_matrix_loaded:
+                raise RuntimeError(
+                    f"PyCtrlDPP.load_infl_matrix('{self.calibration_file_path}', "
+                    f"operation_mode = '{self.operation_mode}') returned False. "
+                    "No exception was raised, but the file wasn't loaded as a valid "
+                    "influence matrix."
+                )
+
+            if not self.dpp.corrections_loaded:
+                try:
+                    flat_field_loaded = self.dpp.load_flat_field(
+                        abs_path=self.calibration_file_path,
+                        operation_mode=self.operation_mode,
+                    )
+                    logger.info(f"Flat offsets loaded: {flat_field_loaded}")
+
+                except Exception as err:
+                    raise RuntimeError(
+                        f"Could not load flat field offsets from "
+                        f"'{self.calibration_file_path}' (orientation "
+                        f"'{self.operation_mode}')."
+                    ) from err
+
+                if not flat_field_loaded:
+                    raise RuntimeError(
+                        f"PyCtrlDPP.load_flat_field(abs_path='{self.calibration_file_path}', "
+                        f"operation_mode='{self.operation_mode}') returned False. No exception "
+                        "was raised but no valid flat field offsets were loaded. "
+                    )
+
+        # Loading an influence matrix sets the SDK's max voltage (and its
+        # allowed range) from the calibration file, so a requested max voltage
+        # is applied after it. None keeps the calibration's value.
+        if self.max_voltage is not None:
+            self._apply_max_voltage(self.max_voltage)
+
+        logger.info(
+            f"PhaseformDPP max voltage: {self.dpp.max_voltage} V "
+            f"(calibration allows {self.dpp.minV}-{self.dpp.maxV} V)."
+        )
 
     def _apply_max_voltage(self, max_voltage):
         """Set the SDK max voltage, raising if the SDK silently rejects it."""
@@ -254,6 +334,57 @@ class PhaseformDPP:
             self._apply_max_voltage(int(max_voltage))
             self.max_voltage = int(max_voltage)
             self._compute_amplitude_limits()
+
+    def get_max_voltage(self):
+        """Return the max drive voltage the SDK is actually using (V)."""
+        return self.dpp.max_voltage
+
+    def set_settle_time(self, settle_time_ms):
+        """Set the wait after each display_modes() write.
+
+        Parameters
+        ----------
+        settle_time_ms : int
+            Milliseconds, 0-1000.
+        """
+        settle_time_ms = int(settle_time_ms)
+        if not 0 <= settle_time_ms <= 1000:
+            raise ValueError(
+                f"settle_time_ms must be between 0 and 1000, got {settle_time_ms}."
+            )
+        self.settle_time_ms = settle_time_ms
+
+    def _ready_to_write(self, action):
+        """Return True if the port is open; otherwise log that nothing is sent.
+
+        The SDK itself only prints (and returns) when the device is not open.
+        """
+        if self._is_connected and getattr(self.dpp, "dpp_ctrl_opened", False):
+            return True
+        logger.error(
+            f"PhaseformDPP.{action}: the device is not connected; nothing was sent."
+        )
+        return False
+
+    def _sdk_accepted(self, coefs):
+        """Return True if the SDK parsed exactly these amplitudes (OSA 1..n)."""
+        parsed = np.asarray(getattr(self.dpp, "zernike_amplitudes", ()), dtype=float)
+        if parsed.shape[0] < self.n_modes + 1:
+            return False
+        return np.allclose(parsed[1 : self.n_modes + 1], coefs, rtol=0, atol=1e-9)
+
+    def _all_zero_voltages(self):
+        """Return True if the SDK's last solved voltages are all zero."""
+        volts = np.asarray(getattr(self.dpp, "voltages", ()), dtype=float).ravel()
+        return volts.size > 0 and not volts.any()
+
+    def _warn_throttled(self, kind, message):
+        """Log a warning at most once per WARNING_INTERVAL_S for each kind."""
+        now = time.monotonic()
+        last = self._last_warning.get(kind)
+        if last is None or now - last >= WARNING_INTERVAL_S:
+            self._last_warning[kind] = now
+            logger.warning(message)
 
     def _compute_amplitude_limits(self):
         """Ask the SDK for the per-mode achievable range (calculation only).
@@ -317,11 +448,16 @@ class PhaseformDPP:
         return (list(pos), list(neg))
 
     def disconnect(self):
-        """Disconnect from the DPP device."""
+        """Disconnect from the DPP device, including a port left open by a
+        connect_device() that failed after opening it."""
         with self._lock:
-            if self._is_connected:
+            if (
+                self._is_connected
+                or getattr(self.dpp, "device_handle", None) is not None
+            ):
                 self.dpp.close()
-                self._is_connected = False
+            self._is_connected = False
+            self.dpp.dpp_ctrl_opened = False  # the SDK's close() leaves it True
 
     def flat(self):
         """
@@ -329,6 +465,8 @@ class PhaseformDPP:
         has been loaded, it will be applied. Errors are logged, not raised.
         """
         with self._lock:
+            if not self._ready_to_write("flat"):
+                return
             try:
                 self.dpp.apply_flat_field()
             except Exception:
@@ -395,6 +533,8 @@ class PhaseformDPP:
         Errors are logged, not raised.
         """
         with self._lock:
+            if not self._ready_to_write("move_absolute_zero"):
+                return
             try:
                 self.dpp.zero_outputs()
             except Exception:
@@ -442,34 +582,73 @@ class PhaseformDPP:
             )
             return
 
+        if not np.isfinite(coefs).all():
+            logger.error(
+                "PhaseformDPP.display_modes: coefficients contain NaN or inf; "
+                "nothing was sent."
+            )
+            return
+
         commanded = coefs.astype(np.float32)
         # Python floats only: the SDK silently truncates a list at the first
         # element that is not a Python float/int (e.g. np.float32).
         phases = [0.0] + [float(c) for c in coefs]
 
         with self._lock:
+            if not self._ready_to_write("display_modes"):
+                return
             try:
                 self.dpp.apply_phases(phases)
             except Exception:
                 logger.exception("PhaseformDPP: apply_phases failed.")
                 return
+            # The SDK returns silently (it only prints) when it cannot parse the
+            # phases (e.g. a list cut short at an np.float32); then the parsed
+            # amplitudes differ from the command and the readback must not change.
+            if not self._sdk_accepted(coefs):
+                logger.error(
+                    "PhaseformDPP.display_modes: the SDK did not accept the "
+                    "command; nothing was sent."
+                )
+                return
+            # A failed voltage solve makes the SDK send 0 V to every channel
+            # without an error; the plate is then not at the command.
+            if self._all_zero_voltages():
+                logger.error(
+                    "PhaseformDPP.display_modes: the SDK's voltage solve failed "
+                    "(all channels 0 V); the plate is not at the command."
+                )
+                return
             self._commanded = commanded
+            if self.settle_time_ms:
+                time.sleep(self.settle_time_ms / 1000)
             self._check_command(commanded)
 
     def _check_command(self, commanded):
-        """Log commands outside the amplitude limits and the model mismatch."""
+        """Warn (rate-limited) when a command is outside the single-mode limits
+        or the model predicts the plate does not reproduce it."""
         pos, neg = self._limits
         if pos is not None:
             outside = [i for i, c in enumerate(commanded) if c > pos[i] or c < neg[i]]
             if outside:
-                logger.warning(
+                self._warn_throttled(
+                    "limits",
                     "PhaseformDPP: commanded value outside the achievable range "
-                    f"for slot(s) {outside}; the plate will saturate."
+                    f"for slot(s) {outside}; the plate will saturate.",
                 )
-        if logger.isEnabledFor(logging.DEBUG):
-            achieved = self.get_achieved_modal_coefs()
-            mismatch = float(np.max(np.abs(achieved - commanded)))
-            logger.debug(f"PhaseformDPP: max |achieved - commanded| = {mismatch:.4f}")
+        achieved = self.get_achieved_modal_coefs()
+        mismatch = np.abs(achieved - commanded)
+        worst = float(np.max(mismatch))
+        if worst > ACHIEVED_TOLERANCE:
+            slots = [i for i, d in enumerate(mismatch) if d > ACHIEVED_TOLERANCE]
+            self._warn_throttled(
+                "achieved",
+                f"PhaseformDPP: the plate reproduces the command only to within "
+                f"{worst:.3f} (slot(s) {slots}): saturation, or a shape it cannot "
+                "form.",
+            )
+        else:
+            logger.debug(f"PhaseformDPP: max |achieved - commanded| = {worst:.4f}")
 
     def get_modal_coefs(self):
         """
@@ -597,6 +776,8 @@ class PhaseformDPP:
             if use_saved_voltages:
                 saved_voltages = data["voltages"]
                 with self._lock:
+                    if not self._ready_to_write("load_json"):
+                        return None
                     n_channels = self.dpp.influence_matrix.shape[1]
                     pin_offset = 1 if len(saved_voltages) == n_channels else 0
                     self.dpp.set_pins_volts(

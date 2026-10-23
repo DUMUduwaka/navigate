@@ -33,6 +33,7 @@
 Contract tests against the dpp_ctrl library (api_dpp + zernike_pol_calc).
 """
 
+import functools
 import inspect
 import os
 
@@ -60,6 +61,20 @@ calibration_file_path = os.path.join(
 
 number_of_modes = 91
 number_of_channels = 63
+
+
+@pytest.fixture(autouse=True)
+def sdk_volts_cache_off(monkeypatch):
+    """Every SDK object these tests create has its solved-volts cache off, so the
+    tests never read or write saved_voltages.pkl in site-packages."""
+    original = PyCtrlDPP.__init__
+
+    @functools.wraps(original)
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.save_volts_flag = False
+
+    monkeypatch.setattr(PyCtrlDPP, "__init__", init)
 
 
 def create_dpp_sdk():
@@ -314,6 +329,7 @@ def _create_configured_plate():
         calibration_file_path=calibration_file_path,
         operation_mode="v",
         connect=False,
+        settle_time_ms=0,
     )
 
     plate.dpp.load_infl_matrix(
@@ -329,6 +345,7 @@ def _create_configured_plate():
 def _open_without_hardware(plate, monkeypatch):
     """Let apply_phases() run the real solver while skipping the serial write."""
     monkeypatch.setattr(plate.dpp, "dpp_ctrl_opened", True)
+    monkeypatch.setattr(plate, "_is_connected", True)
     monkeypatch.setattr(plate.dpp, "_send_voltages", lambda: None)
 
 
@@ -417,6 +434,98 @@ def test_connect_applies_max_voltage_after_loading_calibration(monkeypatch):
     plate.connect()
 
     assert plate.dpp.max_voltage == 200
+
+
+def test_load_infl_matrix_sets_max_voltage_to_the_calibration_maximum():
+    """Loading a calibration overwrites the max voltage with the calibration's
+    maximum (a real calibration capped it at 290 V, so 300 V is then rejected)."""
+    dpp = create_dpp_sdk()
+    dpp.set_max_voltage(200)
+
+    dpp.load_infl_matrix(abs_path=calibration_file_path, operation_mode="v")
+
+    assert dpp.max_voltage == dpp.maxV
+
+
+def test_connect_without_max_voltage_keeps_the_calibration_value(monkeypatch):
+    """With no max_voltage requested, connect() must not call set_max_voltage."""
+    from navigate.model.devices.APIs.phaseform.phaseplate import PhaseformDPP
+
+    plate = PhaseformDPP(
+        port="COM_UNUSED",
+        calibration_file_path=calibration_file_path,
+        operation_mode="v",
+        connect=False,
+    )
+    monkeypatch.setattr(plate.dpp, "connect_device", lambda port_name: True)
+    monkeypatch.setattr(plate.dpp, "get_device_status", lambda: None)
+    requested = []
+    monkeypatch.setattr(
+        plate.dpp, "set_max_voltage", lambda *args, **kwargs: requested.append(args)
+    )
+
+    plate.connect()
+
+    assert requested == []
+    assert plate.dpp.max_voltage == plate.dpp.maxV
+
+
+def test_volts_cache_is_off_and_never_used_or_saved(monkeypatch):
+    """PhaseformDPP turns the SDK's solved-volts cache off before loading."""
+    from navigate.model.devices.APIs.phaseform.phaseplate import PhaseformDPP
+
+    # Undo the autouse fixture: PhaseformDPP itself must switch the cache off.
+    monkeypatch.setattr(PyCtrlDPP, "__init__", PyCtrlDPP.__init__.__wrapped__)
+    plate = PhaseformDPP(
+        port="COM_UNUSED",
+        calibration_file_path=calibration_file_path,
+        operation_mode="v",
+        connect=False,
+    )
+    saved = []
+    monkeypatch.setattr(
+        plate.dpp, "save_calculated_volts", lambda *a, **k: saved.append(a)
+    )
+
+    plate.dpp.load_infl_matrix(abs_path=calibration_file_path, operation_mode="v")
+    plate.dpp.apply_phases([0.0, 0.0, 0.0, 0.0, 0.1], calculate_only=True)
+
+    assert plate.dpp.save_volts_flag is False
+    assert not plate.dpp.use_saved_volts
+    assert not plate.dpp.saved_volts_data_loaded
+    assert saved == []
+
+
+def test_sdk_exposes_the_handle_and_voltages_phaseformdpp_checks():
+    """PhaseformDPP.disconnect() reads device_handle, and display_modes() reads
+    voltages to detect a failed solve (all channels 0 V). With flat offsets
+    loaded (any JSON calibration) the solver writes corrected_voltages, which
+    _send_voltages() copies into voltages on a real write; a calculate-only
+    solve leaves voltages unset."""
+    dpp = configured_dpp()
+    assert dpp.device_handle is None  # no port opened
+    assert dpp.corrections_loaded
+
+    dpp.apply_phases([0.0, 0.0, 0.0, 0.0, 0.1], calculate_only=True)
+
+    volts = np.asarray(dpp.corrected_voltages, dtype=float).ravel()
+    assert volts.size >= 63 and volts.any()
+
+
+def test_parsed_amplitudes_reveal_a_command_the_sdk_cut_short(monkeypatch):
+    """PhaseformDPP compares zernike_amplitudes with the command to detect the
+    SDK's silent early returns (here: a list cut at an np.float32)."""
+    plate = _create_configured_plate()
+    _open_without_hardware(plate, monkeypatch)
+    command = np.full(plate.n_modes, 0.05)
+
+    plate.dpp.apply_phases([0.0] + [float(c) for c in command], calculate_only=True)
+    assert plate._sdk_accepted(command)
+
+    plate.dpp.apply_phases(
+        [0.0, np.float32(0.05)] + [0.05] * (plate.n_modes - 1), calculate_only=True
+    )
+    assert not plate._sdk_accepted(command)
 
 
 @pytest.mark.parametrize(

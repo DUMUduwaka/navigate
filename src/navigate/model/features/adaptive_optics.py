@@ -34,6 +34,7 @@
 # Standard Library Imports
 from queue import Queue
 from copy import deepcopy
+import threading
 import time
 
 # Third Party Imports
@@ -46,6 +47,25 @@ from navigate.model.features.base import FeatureBase
 from navigate.model.features.common_features import PrepareNextChannel
 import navigate.model.analysis.image_contrast as img_contrast
 from navigate.model.features.image_writer import ImageWriter
+
+#: float: fraction of a mode's amplitude limit TonyWilson sweeps up to (mirrors
+#: that report limits only, e.g. Phaseform DPP); single-mode limits overstate
+#: the headroom left when other modes are already corrected.
+SWEEP_LIMIT_MARGIN = 0.9
+
+#: float: smallest sweep scale, as a fraction of the amplitude.
+SWEEP_SCALE_MIN = 0.01
+
+#: float: a check frame may be up to this fraction below the reference and still
+#: be accepted, so frame-to-frame noise does not reject small good corrections.
+CHECK_TOLERANCE = 0.02
+
+#: float: seconds the signal thread waits for the data thread (a fit or a check
+#: decision) before it stops the run; below navigate's 10 s camera timeout.
+WAIT_TIMEOUT_S = 5.0
+
+#: int: failed mirror updates in a row after which the run stops.
+MAX_MIRROR_FAILURES = 3
 
 
 def poly2(x, a, b, c):
@@ -276,8 +296,13 @@ class TonyWilson(FeatureBase):
         self.model.run_command("acquire")
 
     def get_tw_frame_num(self):
-        """Calculate how many frames are needed: iterations x steps x num_coefs"""
-        return self.tw_settings["iterations"] * self.tw_settings["steps"] * self.n_coefs
+        """Frames per run: one reference frame, then for every iteration and armed
+        mode the sweep steps plus one check frame."""
+        n_iter = self.tw_settings["iterations"]
+        n_steps = self.tw_settings["steps"]
+        if self.n_coefs < 1 or n_iter < 1 or n_steps < 1:
+            return 0
+        return 1 + n_iter * self.n_coefs * (n_steps + 1)
 
     # don't need this?
     def get_steps(self, ranges, step_size):
@@ -301,6 +326,19 @@ class TonyWilson(FeatureBase):
         pos_offset = (steps // 2) * step_size + step_size
         return steps, pos_offset
 
+    def build_schedule(self):
+        """Return the frame plan: (kind, iteration, armed index, step) per frame.
+
+        kind is "reference" (once, at the start), "sweep" (n_steps per mode) or
+        "check" (once per mode, with that mode's fitted update applied).
+        """
+        schedule = [("reference", None, None, None)]
+        for itr in range(self.n_iter):
+            for coef in range(self.n_coefs):
+                schedule += [("sweep", itr, coef, step) for step in range(self.n_steps)]
+                schedule.append(("check", itr, coef, None))
+        return schedule
+
     def pre_func_signal(self):
         """Prepare the signal"""
         # initialize the mirror and coef lists, etc
@@ -309,6 +347,7 @@ class TonyWilson(FeatureBase):
         self.start_time = time.time()
 
         self.done_all = False
+        self.done_itr = False
 
         self.n_iter = self.tw_settings["iterations"]
         self.n_steps = self.tw_settings["steps"]
@@ -319,8 +358,23 @@ class TonyWilson(FeatureBase):
         ).astype(np.float32)
 
         self.signal_id = 0
-        self.target_signal_id = 0
-        self.total_frame_num = self.get_tw_frame_num()
+        self.schedule = self.build_schedule()
+        self.total_frame_num = len(self.schedule)
+
+        # Hand-shake with the data thread. The signal thread waits on these so
+        # that every sweep frame is taken with all accepted corrections applied.
+        #: threading.Condition: guards fits_done and decisions_done.
+        self.progress = threading.Condition()
+        #: int: sweeps fitted so far (set by the data thread).
+        self.fits_done = 0
+        #: int: check frames decided so far (set by the data thread).
+        self.decisions_done = 0
+        #: np.ndarray: accepted coefficients plus the last fitted update.
+        self.candidate_coefs = None
+        #: bool: the run was stopped by a timeout or repeated mirror failures.
+        self.aborted = False
+        self.mirror_failures = 0
+        self.final_written = False
 
         if self.start_from == "flat":
             self.best_coefs = np.zeros(self.n_modes, dtype=np.float32)
@@ -341,17 +395,74 @@ class TonyWilson(FeatureBase):
             pos_lim = neg_lim = None
         if pos_lim is not None and self.coef_amp > 0:
             for j, c in enumerate(self.change_coef):
-                room = min(
+                room = SWEEP_LIMIT_MARGIN * min(
                     pos_lim[c] - self.best_coefs[c], self.best_coefs[c] - neg_lim[c]
                 )
-                self.sweep_scale[j] = np.clip(room / self.coef_amp, 0.1, 1.0)
+                self.sweep_scale[j] = np.clip(
+                    room / self.coef_amp, SWEEP_SCALE_MIN, 1.0
+                )
+                if room < SWEEP_SCALE_MIN * self.coef_amp:
+                    self.model.logger.warning(
+                        f"TonyWilson: mode {self.mode_names[c]} has only "
+                        f"{max(room, 0.0):.3f} of range left; its sweep will "
+                        "saturate."
+                    )
             self.model.logger.info(
                 f"TonyWilson sweep scale per mode: {self.sweep_scale}"
             )
 
+        #: np.ndarray: accepted coefficients (kept for compatibility).
         self.best_coefs_overall = deepcopy(self.best_coefs)
         self.best_metric = 0.0
         self.best_peaks = []
+
+        self.model.logger.info(
+            "TonyWilson: start; modes "
+            f"{[self.mode_names[c] for c in self.change_coef]}, iterations "
+            f"{self.n_iter}, steps {self.n_steps}, amplitude {self.coef_amp}, "
+            f"fit {self.fit_func}, metric {self.metric}, from {self.start_from}, "
+            f"{self.total_frame_num} frames, check tolerance {CHECK_TOLERANCE:.0%}"
+        )
+
+    def wait_for(self, counter, target):
+        """Block the signal thread until the data thread has done `target` fits or
+        decisions (`counter` is "fits_done" or "decisions_done").
+
+        Returns
+        -------
+        bool
+            False if acquisition stopped, or on timeout (the run is then
+            aborted), True otherwise.
+        """
+        deadline = time.monotonic() + WAIT_TIMEOUT_S
+        with self.progress:
+            while getattr(self, counter) < target:
+                if self.model.stop_acquisition or self.aborted:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.abort(
+                        f"the data thread did not finish a {counter} within "
+                        f"{WAIT_TIMEOUT_S:g} s"
+                    )
+                    return False
+                self.progress.wait(min(remaining, 0.1))
+        return True
+
+    def abort(self, reason):
+        """Stop the run and leave the mirror at the accepted coefficients."""
+        if self.aborted:
+            return
+        self.aborted = True
+        self.model.logger.error(f"TonyWilson: stopping the run: {reason}.")
+        try:
+            self.mirror_controller.display_modes(self.best_coefs)
+            self.final_written = True
+            self.model.logger.info(
+                "TonyWilson: mirror set to the accepted coefficients (run aborted)."
+            )
+        except Exception as e:  # noqa: BLE001 - the run is ending anyway
+            print(e)
 
     def in_func_signal(self):
         """Run the signal.
@@ -361,23 +472,37 @@ class TonyWilson(FeatureBase):
         bool
             True if the signal is done, False otherwise
         """
+        if self.aborted or self.signal_id >= self.total_frame_num:
+            return True
+
+        kind, itr, coef, step = self.schedule[self.signal_id]
+        sweep_index = None if itr is None else itr * self.n_coefs + coef
+
+        # A sweep starts only after the previous check was decided, and a check
+        # needs its sweep's fit, so no frame is taken on a stale shape.
+        if (
+            kind == "sweep"
+            and step == 0
+            and not self.wait_for("decisions_done", sweep_index)
+        ):
+            return True
+        if kind == "check" and not self.wait_for("fits_done", sweep_index + 1):
+            return True
 
         out_str = "in_func_signal\n"
-        out_str += f"\tSignal:\t{self.signal_id}\n"
-
-        step = self.signal_id % self.n_steps
-        coef = int(self.signal_id / self.n_steps) % self.n_coefs
-        itr = int(self.signal_id / self.n_steps / self.n_coefs) % self.n_iter
-
+        out_str += f"\tSignal:\t{self.signal_id} ({kind})\n"
         out_str += f"\tStep:\t{step}\n"
         out_str += f"\tC_n:\t{coef}\n"
         out_str += f"\tItr:\t{itr}\n"
 
-        coef_arr = np.zeros(self.n_modes, dtype=np.float32)
-        c = self.change_coef[coef]
-        coef_arr[c] = self.coef_sweep[step] * self.sweep_scale[coef]
-
-        applied_coefs = coef_arr + self.best_coefs
+        if kind == "check":
+            applied_coefs = self.candidate_coefs.copy()
+        else:
+            coef_arr = np.zeros(self.n_modes, dtype=np.float32)
+            if kind == "sweep":
+                c = self.change_coef[coef]
+                coef_arr[c] = self.coef_sweep[step] * self.sweep_scale[coef]
+            applied_coefs = coef_arr + self.best_coefs
 
         out_str += f"\tApply:\t[{' '.join([f'{c:.2f}' for c in applied_coefs])}]\n"
 
@@ -387,7 +512,8 @@ class TonyWilson(FeatureBase):
             self.mirror_controller.display_modes(applied_coefs)
         except Exception as e:
             print(e)
-            return
+            self.count_mirror_failure()
+            return self.aborted
 
         time.sleep(self.model.active_microscope.current_exposure_time / 1000)
 
@@ -399,35 +525,37 @@ class TonyWilson(FeatureBase):
             )
         except Exception as e:
             print(e)
-            return
+            self.count_mirror_failure()
+            return self.aborted
 
         self.model.logger.debug(
-            f"*** TonyWilson > in_func_signal :: iter:{itr}\tcoef:{coef}\tstep:{step}"
+            f"*** TonyWilson > in_func_signal :: {kind} iter:{itr}\tcoef:{coef}"
+            f"\tstep:{step}"
         )
-        coef_str = " ".join([f"{c:.2f}" for c in (coef_arr + self.best_coefs)])
+        coef_str = " ".join([f"{c:.2f}" for c in applied_coefs])
         self.model.logger.debug(
             f"*** TonyWilson > in_func_signal :: display_modes:[{coef_str}]"
         )
 
         if (applied_coefs == curr_mirror_coefs).all() or (applied_coefs == 0).all():
+            self.mirror_failures = 0
             self.signal_id += 1
-
-            self.tw_frame_queue.put(
-                (
-                    self.model.frame_id,
-                    self.total_frame_num - self.signal_id,
-                    itr,
-                    coef,
-                    step,
-                )
-            )
+            self.tw_frame_queue.put((self.model.frame_id, kind, itr, coef, step))
         else:
             out_str += "\tMirror update failed...\n"
+            self.count_mirror_failure()
 
         if self.verbose:
             print(out_str)
 
-        return self.signal_id >= self.total_frame_num
+        return self.signal_id >= self.total_frame_num or self.aborted
+
+    def count_mirror_failure(self):
+        """Abort after MAX_MIRROR_FAILURES failed mirror updates in a row (the
+        same frame would otherwise be retried forever)."""
+        self.mirror_failures += 1
+        if self.mirror_failures >= MAX_MIRROR_FAILURES:
+            self.abort(f"{self.mirror_failures} mirror updates in a row failed")
 
     def end_func_signal(self):
         """End the signal
@@ -440,16 +568,13 @@ class TonyWilson(FeatureBase):
         if self.model.stop_acquisition:
             return True
 
-        return self.signal_id >= self.total_frame_num or self.done_all
+        return self.signal_id >= self.total_frame_num or self.done_all or self.aborted
 
     def pre_func_data(self):
         """Prepare the data"""
-        self.f_frame_id = (
-            -1
-        )  # to indicate if there is one frame need to calculate shannon value,
-        # but the image frame isn't ready
-        self.frame_num = 10  # any value but not 1
-        self.target_frame_id = 0  # frame id in the buffer with best focus
+        #: tuple: queued frame (frame_id, kind, itr, coef, step) whose image has
+        #: not arrived yet; kept on self because it can arrive in a later call.
+        self.pending = None
         self.get_frames_num = 0
         self.plot_data = []
         self.trace_list = {}
@@ -462,18 +587,64 @@ class TonyWilson(FeatureBase):
 
         self.frames_done = 0
 
+        #: float: metric of the frame taken with the accepted coefficients.
+        self.reference_metric = None
+        #: list: one entry per check frame (for the log and the summary).
+        self.decisions = []
+
     def process_data(self, coef, mode="poly"):
-        """Process the data
+        """Fit the sweep of armed mode `coef` (index into change_coef).
 
         Parameters
         ----------
         coef : int
-            Coefficient index
+            Armed-mode index of the sweep just completed
         mode : str, optional
             Fitting mode, by default "poly"
+
+        Returns
+        -------
+        tuple
+            (update, R^2): the R^2-weighted correction for this mode, and R^2.
         """
         self.y = self.plot_data
 
+        try:
+            r_2 = self._fit(mode)
+        except (RuntimeError, ValueError) as e:  # curve_fit did not converge
+            self.model.logger.warning(
+                f"TonyWilson: fit failed ({e}); this mode is left unchanged."
+            )
+            self.y_fit = np.zeros_like(self.x_fit)
+            r_2 = 0.0
+        if not np.isfinite(r_2):
+            # e.g. identical metrics at every step (0/0): no information, and a
+            # NaN would make every later command fail the readback check.
+            self.model.logger.warning(
+                "TonyWilson: the metric did not change across the sweep; this "
+                "mode is left unchanged."
+            )
+            r_2 = 0.0
+
+        # weight by R^2 goodness of fit
+        update = self.x_fit[self.y_fit.argmax()] * r_2 * self.sweep_scale[coef]
+        self.mirror_img = self.mirror_controller.get_wavefront_pix()
+
+        # Plot data, as before: the middle frame of each sweep, and the trace
+        # (now stored under the name of the mode that was swept).
+        self.best_peaks.append(self.plot_data[int(self.n_steps / 2)])
+        self.trace_list[self.mode_names[self.change_coef[coef]]] = {
+            "x": np.array(self.x, copy=True),
+            "y": self.y,
+            "x_fit": self.x_fit[::32],
+            "y_fit": self.y_fit[::32],
+        }
+
+        self.plot_data = []
+        return update, r_2
+
+    def _fit(self, mode):
+        """Fit the sweep with the chosen function; return R^2 (sets self.y_fit)."""
         if mode == "poly":
             c = np.min(self.y)  # offset guess
             b = (np.max(self.y) - c) / self.coef_amp  # slope guess
@@ -505,18 +676,74 @@ class TonyWilson(FeatureBase):
             self.y_fit = gauss(self.x_fit, p[0], p[1], p[2], p[3])
             r_2 = r_squared(self.y, gauss(self.x, p[0], p[1], p[2], p[3]))
 
-        self.best_coefs[self.change_coef[coef - 1]] += (
-            self.x_fit[self.y_fit.argmax()] * r_2 * self.sweep_scale[coef - 1]
-        )  # weight by R^2 goodness of fit
-        self.mirror_img = self.mirror_controller.get_wavefront_pix()
+        return r_2
 
-        new_metric = self.plot_data[int(self.n_steps / 2)]
-        self.best_peaks.append(new_metric)
-        if new_metric > self.best_metric:
-            self.best_metric = new_metric
-            self.best_coefs_overall = deepcopy(self.best_coefs)
+    def measure(self, img):
+        """Return the selected image metric."""
+        if self.metric == "Pixel Max":
+            return img.max()
+        elif self.metric == "Pixel Average":
+            return img.mean()
+        elif self.metric == "DCT Shannon Entropy":
+            return img_contrast.fast_normalized_dct_shannon_entropy(img, 3)[0]
 
-        self.plot_data = []
+    def fit_sweep(self, itr, coef):
+        """Fit the completed sweep and propose accepted + update for checking."""
+        c = self.change_coef[coef]
+        metrics = list(self.plot_data)
+        update, r_2 = self.process_data(coef, mode=self.fit_func)
+        candidate = self.best_coefs.copy()
+        candidate[c] += update
+        self.candidate_coefs = candidate
+        self.model.logger.info(
+            f"TonyWilson: iteration {itr + 1}/{self.n_iter}, mode "
+            f"{self.mode_names[c]}: sweep metrics {[float(m) for m in metrics]}, "
+            f"fit update {float(update):+.4f} (R^2 {float(r_2):.3f}), candidate "
+            f"{float(candidate[c]):+.4f}"
+        )
+        with self.progress:
+            self.fits_done += 1
+            self.progress.notify_all()
+
+    def decide(self, metric, itr, coef):
+        """Keep or undo the last update, judged by the check frame."""
+        c = self.change_coef[coef]
+        name = self.mode_names[c]
+        reference = self.reference_metric
+        threshold = reference - CHECK_TOLERANCE * abs(reference)
+        accepted = bool(metric >= threshold)
+        if accepted:
+            self.best_coefs = self.candidate_coefs.copy()
+            self.reference_metric = metric
+            self.model.logger.info(
+                f"TonyWilson: iteration {itr + 1}/{self.n_iter}, mode {name}: check "
+                f"{float(metric):.6g} vs reference {float(reference):.6g} -> "
+                f"accepted, coefficient now {float(self.best_coefs[c]):+.4f}"
+            )
+        else:
+            self.model.logger.warning(
+                f"TonyWilson: iteration {itr + 1}/{self.n_iter}, mode {name}: check "
+                f"{float(metric):.6g} is more than {CHECK_TOLERANCE:.0%} below the "
+                f"reference {float(reference):.6g} -> update "
+                f"{float(self.candidate_coefs[c] - self.best_coefs[c]):+.4f} "
+                f"rejected, coefficient stays {float(self.best_coefs[c]):+.4f}"
+            )
+        self.best_coefs_overall = deepcopy(self.best_coefs)
+        self.decisions.append(
+            {"iteration": itr, "mode": name, "accepted": accepted, "check": metric}
+        )
+
+        if coef == self.n_coefs - 1:
+            # Shrink the sweep before the signal thread is released.
+            self.coef_sweep *= 0.95
+            self.done_itr = True
+            print(f"Done iteration {itr + 1} / {self.n_iter} ...")
+            if itr == self.n_iter - 1:
+                self.done_all = True
+
+        with self.progress:
+            self.decisions_done += 1
+            self.progress.notify_all()
 
     def in_func_data(self, frame_ids=[]):
         """Run the data
@@ -534,90 +761,50 @@ class TonyWilson(FeatureBase):
         self.get_frames_num += len(frame_ids)
 
         out_str = "in_func_data\n"
-
         out_str += f"\tFrames:\t{frame_ids}\n"
-
         out_str += f"\tGet Frames Num:\t{self.get_frames_num}\n"
 
         while True:
-            try:
-                if self.f_frame_id < 0:
-                    (
-                        self.f_frame_id,
-                        self.frame_num,
-                        itr,
-                        coef,
-                        step,
-                    ) = self.tw_frame_queue.get_nowait()
-                if self.f_frame_id not in frame_ids:
-                    out_str += (
-                        f"\tFrame ID {self.f_frame_id} was not in the frame queue...\n"
-                    )
+            if self.pending is None:
+                try:
+                    self.pending = self.tw_frame_queue.get_nowait()
+                except Exception:
+                    out_str += "\tStill waiting tw_frame_queue...\n"
                     break
-            except Exception:
-                out_str += "\tStill waiting tw_frame_queue...\n"
+            frame_id, kind, itr, coef, step = self.pending
+            if frame_id not in frame_ids:
+                out_str += f"\tFrame ID {frame_id} was not in the frame queue...\n"
                 break
+            self.pending = None
 
-            # get the image metric
-            img = self.model.data_buffer[self.f_frame_id]
-
-            """ IMAGE METRICS """
-            if self.metric == "Pixel Max":
-                new_data = img.max()
-            elif self.metric == "Pixel Average":
-                new_data = img.mean()
-            elif self.metric == "DCT Shannon Entropy":
-                new_data = img_contrast.fast_normalized_dct_shannon_entropy(img, 3)[0]
-
-            if len(self.plot_data) == self.n_steps:
-                self.process_data(coef, mode=self.fit_func)
-                self.trace_list[self.mode_names[self.change_coef[coef]]] = {
-                    "x": self.x,
-                    "y": self.y,
-                    "x_fit": self.x_fit[::32],
-                    "y_fit": self.y_fit[::32],
-                }
-                out_str += "\tFITTING DATA...\n"
-
-            self.plot_data.append(new_data)
-            out_str += f"\tTrace:\t{np.flip(self.plot_data)}\n"
-
+            new_data = self.measure(self.model.data_buffer[frame_id])
             self.frames_done += 1
-            out_str += f"\tDone:\t{self.frames_done}\n"
+            out_str += f"\t{kind}: {new_data}\tDone:\t{self.frames_done}\n"
 
-            self.f_frame_id = -1
-
-            self.model.logger.debug(
-                f"*** TonyWilson > in_func_data :: plot_data: {np.flip(self.plot_data)}"
-            )
-
-            out_str += f"\tFrame Num:\t{self.frame_num}\n"
-            if self.frame_num == 1:
-                self.frame_num = 10  # any value but not 1
-                return [self.target_frame_id]
-
-            if coef == self.n_coefs - 1:
+            if kind == "reference":
+                self.reference_metric = new_data
+                self.model.logger.info(f"TonyWilson: reference metric {new_data:.6g}")
+            elif kind == "sweep":
+                self.plot_data.append(new_data)
+                self.model.logger.debug(
+                    f"*** TonyWilson > in_func_data :: plot_data: {self.plot_data}"
+                )
                 if step == self.n_steps - 1:
-
-                    self.coef_sweep *= 0.95
-                    self.done_itr = True
-                    out_str += f"\tDone iteration {itr}!\n"
-
-                    if itr == self.n_iter - 1:
-                        self.done_all = True
-                        out_str += "\tDone all!!!\n"
+                    self.fit_sweep(itr, coef)
+            else:
+                self.decide(new_data, itr, coef)
 
         self.tw_data_queue.put((self.frames_done,))
 
         if self.verbose:
             print(out_str)
-        elif self.done_itr:
-            print(f"Done iteration {itr + 1} / {self.n_iter} ...")
 
         if self.frames_done >= self.total_frame_num:
             return frame_ids
 
     def build_report(self):
+
+        print("**** best coefs after all iterations:", self.best_coefs_overall)
 
         return deepcopy(
             {
@@ -647,10 +834,27 @@ class TonyWilson(FeatureBase):
             True if the data is done, False otherwise
         """
         if self.done_all:
-            self.best_coefs = self.best_coefs_overall
             try:
                 stop_time = time.time()
                 print(f"Total runtime:\t{(stop_time - self.start_time):.3f} sec")
+                rejected = [
+                    (d["iteration"] + 1, d["mode"])
+                    for d in self.decisions
+                    if not d["accepted"]
+                ]
+                self.model.logger.info(
+                    f"TonyWilson: done in {stop_time - self.start_time:.1f} s, "
+                    f"{self.frames_done} frames, "
+                    f"{len(self.decisions) - len(rejected)}/{len(self.decisions)} "
+                    f"updates accepted, rejected (iteration, mode): {rejected}; "
+                    "final coefficients "
+                    + str(
+                        {
+                            self.mode_names[c]: round(float(self.best_coefs[c]), 4)
+                            for c in self.change_coef
+                        }
+                    )
+                )
             except Exception as e:
                 print(e)
 
@@ -668,9 +872,20 @@ class TonyWilson(FeatureBase):
 
         self.done_itr = False
 
-        self.mirror_controller.display_modes(self.best_coefs_overall)
+        # Apply the accepted shape once, when the run ends or is stopped. During
+        # the run the signal thread owns the mirror: a write here could land in
+        # the exposure of the next frame.
+        finished = self.done_all or self.aborted or self.model.stop_acquisition
+        if finished and not self.final_written:
+            self.final_written = True
+            self.mirror_controller.display_modes(self.best_coefs)
+            self.model.logger.info(
+                "TonyWilson: mirror set to the accepted coefficients ("
+                + ("run complete" if self.done_all else "run stopped")
+                + ")."
+            )
 
         if self.done_all and self.save_report:
             self.model.event_queue.put(("ao_save_report", self.report))
 
-        return self.frames_done >= self.total_frame_num or self.done_all
+        return self.frames_done >= self.total_frame_num or self.done_all or self.aborted
