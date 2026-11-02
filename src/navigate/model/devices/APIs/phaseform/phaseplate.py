@@ -608,7 +608,7 @@ class PhaseformDPP:
             if not self._sdk_accepted(coefs):
                 logger.error(
                     "PhaseformDPP.display_modes: the SDK did not accept the "
-                    "command; nothing was sent."
+                    "command as given; the plate may not match it."
                 )
                 return
             # A failed voltage solve makes the SDK send 0 V to every channel

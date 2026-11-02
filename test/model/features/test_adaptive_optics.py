@@ -30,7 +30,9 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 """Tests for TonyWilson: sweep scale (mirror amplitude limits), the frame plan,
-the check frame after every fitted update, and the signal/data hand-shake."""
+the check frame after every fitted update (compared with the same sweep's middle
+frame, or a base frame for an even number of steps), the signal/data hand-shake,
+and how a run ends (complete, stopped, aborted, or ended by navigate)."""
 
 import logging
 import queue
@@ -180,6 +182,28 @@ def sweep_commands(frames, coef):
     return out
 
 
+def popup_events(tony_wilson):
+    """The last event of each name sent to the controller (AO popup)."""
+    events = {}
+    while not tony_wilson.model.event_queue.empty():
+        name, data = tony_wilson.model.event_queue.get_nowait()
+        events[name] = data
+    return events
+
+
+def with_luck(metric, luck):
+    """Wrap a metric: frame number k (0-based, in time order) is multiplied by
+    luck[k], e.g. one frame that reads 50 % high."""
+    calls = []
+
+    def lucky_metric(cmd):
+        value = metric(cmd) * luck.get(len(calls), 1.0)
+        calls.append(value)
+        return value
+
+    return lucky_metric
+
+
 @pytest.mark.parametrize(
     "controller", [EchoController(), mock.MagicMock()], ids=["no_limits", "mock"]
 )
@@ -230,15 +254,37 @@ def test_sweep_scale_keeps_each_mode_inside_its_limits(monkeypatch):
     assert max(offsets[4]) <= 1.0 - 0.9 + 1e-6
 
 
-def test_frame_plan_has_a_reference_and_a_check_after_every_sweep(monkeypatch):
+def test_frame_plan_has_a_check_after_every_sweep_and_no_reference(monkeypatch):
     tony_wilson = make_tony_wilson(
         monkeypatch, EchoController(), armed=[3, 4], iterations=2, steps=3
     )
 
     kinds = [kind for kind, *_ in tony_wilson.schedule]
 
-    assert tony_wilson.total_frame_num == tony_wilson.get_tw_frame_num() == 17
-    assert kinds == ["reference"] + (["sweep"] * 3 + ["check"]) * 4
+    assert tony_wilson.total_frame_num == tony_wilson.get_tw_frame_num() == 16
+    assert kinds == (["sweep"] * 3 + ["check"]) * 4
+
+
+def test_even_number_of_steps_adds_a_base_frame_before_each_check(monkeypatch):
+    tony_wilson = make_tony_wilson(
+        monkeypatch, EchoController(), armed=[3, 4], iterations=2, steps=4
+    )
+
+    kinds = [kind for kind, *_ in tony_wilson.schedule]
+
+    assert tony_wilson.total_frame_num == tony_wilson.get_tw_frame_num() == 24
+    assert kinds == (["sweep"] * 4 + ["base", "check"]) * 4
+
+
+@pytest.mark.parametrize("steps", [3, 5, 7, 9])
+def test_middle_sweep_step_is_exactly_the_accepted_coefficients(monkeypatch, steps):
+    tony_wilson = make_tony_wilson(
+        monkeypatch, EchoController(), armed=[3], amplitude=0.1, steps=steps
+    )
+
+    assert tony_wilson.coef_sweep[steps // 2] == 0.0
+    tony_wilson.coef_sweep *= 0.95  # the shrink after each iteration
+    assert tony_wilson.coef_sweep[steps // 2] == 0.0
 
 
 @pytest.mark.parametrize("iterations", [1, 2])
@@ -389,7 +435,7 @@ def test_wait_timeout_stops_the_run(monkeypatch, caplog):
     tony_wilson = make_tony_wilson(
         monkeypatch, controller, armed=[3], start=np.zeros(32), steps=3
     )
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.INFO)
 
     for _ in range(10):  # no data thread: the check waits for a fit forever
         if tony_wilson.end_func_signal():
@@ -397,16 +443,18 @@ def test_wait_timeout_stops_the_run(monkeypatch, caplog):
         tony_wilson.in_func_signal()
 
     assert tony_wilson.aborted and tony_wilson.end_func_signal()
-    assert tony_wilson.signal_id == 4  # reference + 3 sweep steps
+    assert tony_wilson.signal_id == 3  # the 3 sweep steps
     np.testing.assert_array_equal(controller.commands[-1], np.zeros(32))
     assert "stopping the run" in caplog.text
+    assert "TonyWilson: run aborted after" in caplog.text
+    assert "accepted coefficients (run aborted)" in caplog.text
 
 
 def test_stop_ends_a_wait_without_aborting(monkeypatch):
     tony_wilson = make_tony_wilson(
         monkeypatch, EchoController(), armed=[3], start=np.zeros(32), steps=3
     )
-    for _ in range(4):  # reference + 3 sweep steps
+    for _ in range(3):  # the 3 sweep steps
         tony_wilson.in_func_signal()
     tony_wilson.model.stop_acquisition = True
 
@@ -432,7 +480,7 @@ def test_repeated_mirror_failures_stop_the_run(monkeypatch, caplog):
         tony_wilson.in_func_signal()
 
     assert tony_wilson.aborted
-    assert tony_wilson.signal_id == 1  # only the all-zero reference frame passed
+    assert tony_wilson.signal_id == 0  # the first sweep frame never passed
     assert "3 mirror updates in a row failed" in caplog.text
 
 
@@ -448,7 +496,7 @@ def test_frame_arriving_after_its_queue_entry_is_processed(monkeypatch):
     run_lockstep(tony_wilson, peaked_metric(target), deliver_late=True)
 
     assert tony_wilson.done_all
-    assert tony_wilson.frames_done == tony_wilson.total_frame_num == 13
+    assert tony_wilson.frames_done == tony_wilson.total_frame_num == 12
     assert tony_wilson.best_coefs[3] == pytest.approx(0.05, abs=0.01)
 
 
@@ -462,18 +510,76 @@ def test_accepted_shape_is_written_once_at_the_end(monkeypatch):
     np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
 
 
-def test_stopped_run_applies_the_accepted_shape(monkeypatch):
+def test_stopped_run_applies_the_accepted_shape(monkeypatch, caplog):
     controller = EchoController()
     tony_wilson = make_tony_wilson(monkeypatch, controller, armed=[3])
     tony_wilson.pre_func_data()
     tony_wilson.best_coefs[3] = 0.04
     tony_wilson.model.stop_acquisition = True
+    caplog.set_level(logging.INFO)
 
     tony_wilson.end_func_data()
     tony_wilson.end_func_data()
+    tony_wilson.cleanup()  # navigate's end of acquisition: nothing more
 
     assert controller.commands[-1][3] == pytest.approx(0.04)
     assert len(controller.commands) == 1
+    assert "TonyWilson: run stopped after" in caplog.text
+    assert "accepted coefficients (run stopped)" in caplog.text
+    events = popup_events(tony_wilson)
+    assert events["mirror_update"]["coefs"][3] == pytest.approx(0.04)
+    assert events["tonywilson"]["done"] is True  # popup -> experiment values
+
+
+def test_last_frame_still_in_flight_when_navigate_sets_stop_completes_the_run(
+    monkeypatch, caplog
+):
+    """navigate sets stop_acquisition once the signal side has sent its last
+    frame, while the data thread is still processing it: that is not a Stop."""
+    controller = EchoController()
+    target = np.zeros(32)
+    target[3] = 0.05
+    tony_wilson = make_tony_wilson(
+        monkeypatch, controller, armed=[3], start=np.zeros(32), steps=3
+    )
+    tony_wilson.pre_func_data()
+    model = tony_wilson.model
+    metric = peaked_metric(target)
+    caplog.set_level(logging.INFO)
+    k = 0
+    while tony_wilson.signal_id < tony_wilson.total_frame_num:
+        model.frame_id = k
+        tony_wilson.in_func_signal()
+        model.data_buffer[k] = np.full((2, 2), metric(controller._last))
+        if tony_wilson.signal_id < tony_wilson.total_frame_num:
+            tony_wilson.in_func_data([k])  # every frame but the last (the check)
+            tony_wilson.end_func_data()
+        k += 1
+
+    model.stop_acquisition = True  # set by navigate, not by the user
+    tony_wilson.end_func_data()
+    assert not tony_wilson.final_written
+
+    tony_wilson.in_func_data([k - 1])
+    tony_wilson.end_func_data()
+
+    assert tony_wilson.done_all and tony_wilson.final_written
+    assert "(run complete)" in caplog.text and "(run stopped)" not in caplog.text
+    np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
+    assert tony_wilson.best_coefs[3] == pytest.approx(0.05, abs=0.01)
+
+
+def test_cleanup_before_the_data_side_started_still_restores_the_mirror(
+    monkeypatch,
+):
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(monkeypatch, controller, armed=[3], steps=3)
+    tony_wilson.in_func_signal()  # first sweep frame, then the camera stalls
+
+    tony_wilson.cleanup()  # pre_func_data never ran
+
+    np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
+    assert popup_events(tony_wilson)["mirror_update"]["mirror_img"] is None
 
 
 def test_flat_metric_leaves_the_mode_unchanged_instead_of_nan(monkeypatch, caplog):
@@ -515,3 +621,292 @@ def test_trace_is_stored_under_the_swept_mode(monkeypatch):
     run_lockstep(tony_wilson, peaked_metric(np.zeros(32)))
 
     assert list(tony_wilson.trace_list) == ["mode3", "mode4"]
+
+
+def test_a_lucky_check_frame_does_not_raise_the_bar_for_later_modes(monkeypatch):
+    """Round 2 kept an accepted check frame as the reference for every later
+    check, so one lucky frame rejected the good updates after it."""
+    armed = [3, 4, 5]
+    target = np.zeros(32)
+    target[armed] = [0.05, -0.04, 0.03]
+    tony_wilson = make_tony_wilson(
+        monkeypatch, EchoController(), armed=armed, start=np.zeros(32), steps=3
+    )
+    metric = with_luck(peaked_metric(target), {3: 1.5})  # frame 3: first check
+
+    run_lockstep(tony_wilson, metric)
+
+    assert [d["accepted"] for d in tony_wilson.decisions] == [True, True, True]
+    for c in armed:
+        assert abs(tony_wilson.best_coefs[c] - target[c]) < 0.01
+
+
+def test_each_check_is_compared_with_the_middle_frame_of_its_own_sweep(
+    monkeypatch, caplog
+):
+    armed = [3, 4]
+    target = np.zeros(32)
+    target[armed] = [0.05, -0.04]
+    tony_wilson = make_tony_wilson(
+        monkeypatch,
+        EchoController(),
+        armed=armed,
+        start=np.zeros(32),
+        iterations=2,
+        steps=3,
+    )
+    # frame 5 = middle frame of the second mode's first sweep, reading 50 % high
+    metric = with_luck(peaked_metric(target), {5: 1.5})
+    caplog.set_level(logging.INFO)
+
+    frames = run_lockstep(tony_wilson, metric)
+
+    sweeps = {}
+    for k, ((kind, itr, coef, step), _) in enumerate(frames):
+        if kind == "sweep" and step == 1:
+            sweeps[(itr, coef)] = k
+    for d in tony_wilson.decisions:
+        k = sweeps[(d["iteration"], armed.index(int(d["mode"][4:])))]
+        assert d["base"] == pytest.approx(metric_value(tony_wilson, frames, k))
+    # the lucky middle frame costs that one decision; iteration 2 makes up for it
+    assert [d["accepted"] for d in tony_wilson.decisions] == [True, False, True, True]
+    assert abs(tony_wilson.best_coefs[4] - target[4]) < 0.01
+    assert "vs its middle sweep frame" in caplog.text
+
+
+def metric_value(tony_wilson, frames, k):
+    """Metric of frame k as the data thread measured it."""
+    return float(tony_wilson.model.data_buffer[k].max())
+
+
+def test_even_steps_compare_the_check_with_a_frame_at_the_accepted_shape(
+    monkeypatch, caplog
+):
+    armed = [3, 4]
+    target = np.zeros(32)
+    target[armed] = [0.05, -0.04]
+    tony_wilson = make_tony_wilson(
+        monkeypatch,
+        EchoController(),
+        armed=armed,
+        start=np.zeros(32),
+        iterations=2,
+        steps=4,
+    )
+    accepted_before = []
+    original = tony_wilson.decide
+
+    def spy(metric, itr, coef):
+        accepted_before.append(tony_wilson.best_coefs.copy())
+        original(metric, itr, coef)
+
+    tony_wilson.decide = spy
+    caplog.set_level(logging.INFO)
+
+    frames = run_lockstep(tony_wilson, peaked_metric(target))
+
+    bases = [(k, cmd) for k, ((kind, *_), cmd) in enumerate(frames) if kind == "base"]
+    assert len(bases) == len(tony_wilson.decisions) == 4
+    for (k, cmd), accepted, d in zip(bases, accepted_before, tony_wilson.decisions):
+        np.testing.assert_array_equal(cmd, accepted)  # the accepted shape
+        assert d["base"] == pytest.approx(metric_value(tony_wilson, frames, k))
+    assert all(d["accepted"] for d in tony_wilson.decisions)
+    assert "vs its base frame" in caplog.text
+    for c in armed:
+        assert abs(tony_wilson.best_coefs[c] - target[c]) < 0.01
+
+
+@pytest.mark.parametrize(
+    "armed, steps, iterations, reason",
+    [
+        ([], 5, 1, "no modes are selected"),
+        ([3], 2, 1, "steps must be at least 3"),
+        ([3], 5, 0, "iterations must be at least 1"),
+    ],
+)
+def test_bad_settings_are_refused_without_touching_the_mirror(
+    monkeypatch, caplog, armed, steps, iterations, reason
+):
+    controller = EchoController()
+    caplog.set_level(logging.INFO)
+    tony_wilson = make_tony_wilson(
+        monkeypatch, controller, armed=armed, steps=steps, iterations=iterations
+    )
+    tony_wilson.pre_func_data()
+
+    assert tony_wilson.get_tw_frame_num() == tony_wilson.total_frame_num == 0
+    assert tony_wilson.schedule == []
+    assert tony_wilson.in_func_signal() is True
+    assert tony_wilson.end_func_signal() is True
+    assert tony_wilson.end_func_data() is True
+    tony_wilson.cleanup()
+    assert controller.commands == []
+    assert f"TonyWilson: not started: {reason}" in caplog.text
+    assert "TonyWilson: start;" not in caplog.text
+    assert popup_events(tony_wilson) == {}
+
+
+def test_three_steps_warn_that_the_r2_weighting_has_no_effect(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    make_tony_wilson(monkeypatch, EchoController(), armed=[3], steps=3)
+    assert "R^2 = 1" in caplog.text
+
+    caplog.clear()
+    make_tony_wilson(monkeypatch, EchoController(), armed=[3], steps=5)
+    assert "R^2 = 1" not in caplog.text
+
+
+def test_cleanup_after_a_camera_timeout_restores_the_accepted_shape(
+    monkeypatch, caplog
+):
+    """navigate ends the acquisition after a camera timeout without the end
+    functions seeing a stop; its cleanup call must put the accepted shape back
+    (round 2 left the plate at the last sweep shape)."""
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(
+        monkeypatch, controller, armed=[3, 4], start=np.zeros(32), steps=3
+    )
+    tony_wilson.pre_func_data()
+    tony_wilson.best_coefs[3] = 0.03  # accepted earlier in the run
+    tony_wilson.in_func_signal()  # first sweep frame (-0.2); then no camera frame
+    assert controller.commands[-1][3] == pytest.approx(0.03 - 0.2)
+    caplog.set_level(logging.INFO)
+
+    tony_wilson.cleanup()
+    tony_wilson.cleanup()
+
+    np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
+    assert len(controller.commands) == 2  # 1 sweep frame + 1 final write
+    assert tony_wilson.aborted and tony_wilson.in_func_signal() is True
+    assert "acquisition ended before the run finished" in caplog.text
+    assert "accepted coefficients (run ended early)" in caplog.text
+    assert "TonyWilson: run ended early after" in caplog.text
+    assert popup_events(tony_wilson)["mirror_update"]["coefs"][3] == pytest.approx(0.03)
+
+
+def test_cleanup_when_the_last_frame_was_sent_but_never_arrived_ended_early(
+    monkeypatch, caplog
+):
+    """navigate sets stop_acquisition once the signal side has sent its last
+    frame; a camera timeout on that frame is not a Stop."""
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(
+        monkeypatch, controller, armed=[3], start=np.zeros(32), steps=3
+    )
+    tony_wilson.pre_func_data()
+    model = tony_wilson.model
+    metric = peaked_metric(np.zeros(32))
+    for k in range(tony_wilson.total_frame_num):
+        model.frame_id = k
+        tony_wilson.in_func_signal()
+        model.data_buffer[k] = np.full((2, 2), metric(controller._last))
+        if k < tony_wilson.total_frame_num - 1:  # the check frame never arrives
+            tony_wilson.in_func_data([k])
+            tony_wilson.end_func_data()
+    model.stop_acquisition = True  # set by navigate after the last frame
+    caplog.set_level(logging.INFO)
+
+    tony_wilson.cleanup()
+
+    assert "acquisition ended before the run finished" in caplog.text
+    assert "(run ended early)" in caplog.text and "(run stopped)" not in caplog.text
+    np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
+
+
+def test_a_sweep_write_under_way_cannot_overtake_the_final_write(monkeypatch):
+    """After a camera timeout navigate runs cleanup() in the data thread while
+    the signal thread may be writing a sweep shape: the final write comes last."""
+
+    class SlowController(EchoController):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def display_modes(self, coefs):
+            if not self.entered.is_set():  # the first (sweep) write is slow
+                self.entered.set()
+                self.release.wait(5)
+            super().display_modes(coefs)
+
+    controller = SlowController()
+    tony_wilson = make_tony_wilson(
+        monkeypatch, controller, armed=[3], start=np.zeros(32), steps=3
+    )
+    tony_wilson.pre_func_data()
+    signal = threading.Thread(target=tony_wilson.in_func_signal)
+    signal.start()
+    assert controller.entered.wait(5)  # the sweep write is under way
+    data = threading.Thread(target=tony_wilson.cleanup)
+    data.start()
+    time.sleep(0.1)  # cleanup() now waits for the sweep write
+    controller.release.set()
+    signal.join(5)
+    data.join(5)
+
+    assert len(controller.commands) == 2
+    assert controller.commands[0][3] == pytest.approx(-0.2)  # the sweep shape
+    np.testing.assert_array_equal(controller.commands[-1], tony_wilson.best_coefs)
+    assert tony_wilson.in_func_signal() is True
+    assert len(controller.commands) == 2  # nothing written after the final write
+
+
+def test_a_failing_summary_does_not_skip_the_final_write(monkeypatch, caplog):
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(monkeypatch, controller, armed=[3])
+    tony_wilson.pre_func_data()
+    tony_wilson.best_coefs[3] = 0.04
+
+    def broken(how):
+        raise KeyError("x")
+
+    tony_wilson.log_summary = broken
+    caplog.set_level(logging.INFO)
+    tony_wilson.model.stop_acquisition = True
+
+    tony_wilson.end_func_data()
+
+    assert controller.commands[-1][3] == pytest.approx(0.04)
+    assert "TonyWilson: no summary" in caplog.text
+
+
+def test_cleanup_after_a_complete_run_does_nothing(monkeypatch):
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(monkeypatch, controller, armed=[3, 4])
+    run_lockstep(tony_wilson, peaked_metric(np.zeros(32)))
+    writes = len(controller.commands)
+
+    tony_wilson.cleanup()
+
+    assert len(controller.commands) == writes
+
+
+def test_navigate_calls_the_cleanup_when_the_acquisition_ends(monkeypatch):
+    """load_features puts TonyWilson in the cleanup lists that end_acquisition
+    runs (model.py), so its cleanup runs however the acquisition ends."""
+    from navigate.model.features.feature_container import load_features
+
+    controller = EchoController()
+    tony_wilson = make_tony_wilson(monkeypatch, controller, armed=[3])
+    model = tony_wilson.model
+    created = []
+    original_init = adaptive_optics.TonyWilson.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(adaptive_optics.TonyWilson, "__init__", init)
+    signal_container, data_container = load_features(
+        model, [{"name": adaptive_optics.TonyWilson}]
+    )
+    (feature,) = created
+    feature.pre_func_signal()
+    feature.pre_func_data()
+    feature.best_coefs[3] = 0.02
+
+    signal_container.cleanup()
+    data_container.cleanup()
+
+    assert controller.commands[-1][3] == pytest.approx(0.02)
+    assert len(controller.commands) == 1  # written once

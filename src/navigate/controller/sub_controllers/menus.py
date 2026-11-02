@@ -1045,10 +1045,20 @@ class MenuController(GUIController):
 
     @log_function_call
     def popup_adaptiveoptics(self) -> None:
-        """Pop up the Adaptive Optics setting window."""
-        if hasattr(self.parent_controller, "adaptiveoptics_popup_controller"):
-            self.parent_controller.ao_popup_controller.showup()
-            return
+        """Pop up the Adaptive Optics setting window.
+
+        Only one window: if it is open, bring it to the front. Closing the window
+        destroys it (the controller stays), so then a new one is created.
+        """
+        ao_controller = getattr(self.parent_controller, "ao_popup_controller", None)
+        if ao_controller is not None:
+            try:
+                is_open = bool(ao_controller.view.popup.winfo_exists())
+            except (tk.TclError, AttributeError):  # the window or Tk is gone
+                is_open = False
+            if is_open:
+                ao_controller.showup()
+                return
         ao_popup = AdaptiveOpticsPopup(
             self.view, configuration=self.parent_controller.configuration
         )

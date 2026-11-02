@@ -531,7 +531,7 @@ def test_a_command_the_sdk_drops_keeps_the_previous_readback(plate, caplog):
     plate.display_modes(np.full(32, 0.2, dtype=np.float32))
 
     assert plate.get_modal_coefs()[0] == pytest.approx([0.1] * 32)
-    assert "did not accept the command" in caplog.text
+    assert "command as given; the plate may not match it" in caplog.text
 
 
 def test_non_finite_coefficients_are_not_sent(plate, caplog):

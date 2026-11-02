@@ -56,9 +56,13 @@ SWEEP_LIMIT_MARGIN = 0.9
 #: float: smallest sweep scale, as a fraction of the amplitude.
 SWEEP_SCALE_MIN = 0.01
 
-#: float: a check frame may be up to this fraction below the reference and still
-#: be accepted, so frame-to-frame noise does not reject small good corrections.
+#: float: a check frame may be up to this fraction below its base frame (the
+#: same sweep's middle frame, taken with the accepted coefficients) and still be
+#: accepted, so frame-to-frame noise does not reject small good corrections.
 CHECK_TOLERANCE = 0.02
+
+#: int: fewest sweep steps a run accepts (a parabola needs three points).
+MIN_STEPS = 3
 
 #: float: seconds the signal thread waits for the data thread (a fit or a check
 #: decision) before it stops the run; below navigate's 10 s camera timeout.
@@ -256,16 +260,26 @@ class TonyWilson(FeatureBase):
         # target channel
         self.target_channel = 1
 
+        #: bool: the accepted shape has been written at the end of the run.
+        self.final_written = False
+        #: str: why the run was refused (bad settings), or None.
+        self.refused = None
+        #: threading.RLock: makes the end-of-run write happen exactly once, and
+        #: after any sweep write already under way in the signal thread.
+        self.finish_lock = threading.RLock()
+
         self.config_table = {
             "signal": {
                 "init": self.pre_func_signal,
                 "main": self.in_func_signal,
                 "end": self.end_func_signal,
+                "cleanup": self.cleanup,
             },
             "data": {
                 "init": self.pre_func_data,
                 "main": self.in_func_data,
                 "end": self.end_func_data,
+                "cleanup": self.cleanup,
             },
             "node": {"node_type": "multi-step", "device_related": True},
         }
@@ -295,14 +309,25 @@ class TonyWilson(FeatureBase):
 
         self.model.run_command("acquire")
 
+    def settings_problem(self):
+        """Return why these settings can't run (None if they can)."""
+        if self.n_coefs < 1:
+            return "no modes are selected"
+        if self.tw_settings["iterations"] < 1:
+            return "iterations must be at least 1"
+        if self.tw_settings["steps"] < MIN_STEPS:
+            return f"steps must be at least {MIN_STEPS} (a parabola needs 3 points)"
+        return None
+
     def get_tw_frame_num(self):
-        """Frames per run: one reference frame, then for every iteration and armed
-        mode the sweep steps plus one check frame."""
-        n_iter = self.tw_settings["iterations"]
-        n_steps = self.tw_settings["steps"]
-        if self.n_coefs < 1 or n_iter < 1 or n_steps < 1:
+        """Frames per run: for every iteration and armed mode, the sweep steps,
+        one base frame if the number of steps is even (an odd sweep's middle step
+        is the base), and one check frame."""
+        if self.settings_problem():
             return 0
-        return 1 + n_iter * self.n_coefs * (n_steps + 1)
+        n_steps = self.tw_settings["steps"]
+        per_sweep = n_steps + (1 if n_steps % 2 == 0 else 0) + 1
+        return self.tw_settings["iterations"] * self.n_coefs * per_sweep
 
     # don't need this?
     def get_steps(self, ranges, step_size):
@@ -329,13 +354,20 @@ class TonyWilson(FeatureBase):
     def build_schedule(self):
         """Return the frame plan: (kind, iteration, armed index, step) per frame.
 
-        kind is "reference" (once, at the start), "sweep" (n_steps per mode) or
-        "check" (once per mode, with that mode's fitted update applied).
+        kind is "sweep" (n_steps per mode), "base" (only for an even number of
+        steps: one frame with the accepted coefficients, because the sweep has no
+        middle step) or "check" (once per mode, with that mode's fitted update
+        applied). The check is compared with the base: the sweep's middle frame,
+        or the base frame.
         """
-        schedule = [("reference", None, None, None)]
+        if self.refused:
+            return []
+        schedule = []
         for itr in range(self.n_iter):
             for coef in range(self.n_coefs):
                 schedule += [("sweep", itr, coef, step) for step in range(self.n_steps)]
+                if self.n_steps % 2 == 0:
+                    schedule.append(("base", itr, coef, None))
                 schedule.append(("check", itr, coef, None))
         return schedule
 
@@ -354,8 +386,19 @@ class TonyWilson(FeatureBase):
         self.coef_amp = self.tw_settings["amplitude"]
 
         self.coef_sweep = np.linspace(
-            -self.coef_amp, self.coef_amp, self.n_steps
+            -self.coef_amp, self.coef_amp, max(self.n_steps, 0)
         ).astype(np.float32)
+        if self.n_steps > 0 and self.n_steps % 2 == 1:
+            # The middle step is the base of the check: exactly the accepted
+            # coefficients, without linspace rounding.
+            self.coef_sweep[self.n_steps // 2] = 0.0
+
+        self.refused = self.settings_problem()
+        if self.refused:
+            self.model.logger.warning(
+                f"TonyWilson: not started: {self.refused}. The mirror was not "
+                "changed."
+            )
 
         self.signal_id = 0
         self.schedule = self.build_schedule()
@@ -416,13 +459,28 @@ class TonyWilson(FeatureBase):
         self.best_metric = 0.0
         self.best_peaks = []
 
+        if self.refused:
+            return
+
+        base = (
+            "its sweep's middle frame"
+            if self.n_steps % 2 == 1
+            else "a frame with the accepted coefficients (even number of steps)"
+        )
         self.model.logger.info(
             "TonyWilson: start; modes "
             f"{[self.mode_names[c] for c in self.change_coef]}, iterations "
             f"{self.n_iter}, steps {self.n_steps}, amplitude {self.coef_amp}, "
             f"fit {self.fit_func}, metric {self.metric}, from {self.start_from}, "
-            f"{self.total_frame_num} frames, check tolerance {CHECK_TOLERANCE:.0%}"
+            f"{self.total_frame_num} frames; each check is compared with {base}, "
+            f"tolerance {CHECK_TOLERANCE:.0%}"
         )
+        if self.n_steps == MIN_STEPS:
+            self.model.logger.warning(
+                f"TonyWilson: with {MIN_STEPS} steps every fit passes exactly "
+                "through the points (R^2 = 1), so the R^2 weighting has no "
+                "effect; use 5 or more steps to have it."
+            )
 
     def wait_for(self, counter, target):
         """Block the signal thread until the data thread has done `target` fits or
@@ -455,14 +513,89 @@ class TonyWilson(FeatureBase):
             return
         self.aborted = True
         self.model.logger.error(f"TonyWilson: stopping the run: {reason}.")
-        try:
-            self.mirror_controller.display_modes(self.best_coefs)
+        self.finish("aborted")
+
+    def finish(self, how, notify=True):
+        """End of the run, however it ends: log the summary, put the accepted
+        coefficients on the mirror and, unless already done, send them to the AO
+        popup. Runs once; later calls do nothing.
+
+        Parameters
+        ----------
+        how : str
+            "complete", "stopped", "aborted" or "ended early".
+        notify : bool
+            Send the coefficients to the AO popup (a complete run already did).
+        """
+        with self.finish_lock:
+            if self.final_written or self.refused:
+                return
             self.final_written = True
-            self.model.logger.info(
-                "TonyWilson: mirror set to the accepted coefficients (run aborted)."
+            try:
+                self.log_summary(how)
+            except Exception as e:  # noqa: BLE001 - never skip the mirror write
+                self.model.logger.error(f"TonyWilson: no summary ({e}).")
+            try:
+                self.mirror_controller.display_modes(self.best_coefs)
+                self.model.logger.info(
+                    "TonyWilson: mirror set to the accepted coefficients "
+                    f"(run {how})."
+                )
+            except Exception as e:  # noqa: BLE001 - the run is ending anyway
+                self.model.logger.error(
+                    f"TonyWilson: could not set the accepted coefficients ({e})."
+                )
+        if notify:
+            try:
+                report = self.build_report()
+                report["tonywilson"]["done"] = True  # popup -> experiment values
+                self.model.event_queue.put(("mirror_update", report["mirror_update"]))
+                self.model.event_queue.put(("tonywilson", report["tonywilson"]))
+            except Exception as e:  # noqa: BLE001 - the popup may be closed
+                print(e)
+
+    def log_summary(self, how):
+        """Log decisions and coefficients at the end of the run (INFO)."""
+        decisions = getattr(self, "decisions", [])
+        rejected = [
+            (d["iteration"] + 1, d["mode"]) for d in decisions if not d["accepted"]
+        ]
+        start = "done" if how == "complete" else f"run {how}"
+        frames = getattr(self, "frames_done", 0)
+        self.model.logger.info(
+            f"TonyWilson: {start} after {time.time() - self.start_time:.1f} s, "
+            f"{frames} of {self.total_frame_num} frames, "
+            f"{len(decisions) - len(rejected)}/{len(decisions)} updates accepted, "
+            f"rejected (iteration, mode): {rejected}; final coefficients "
+            + str(
+                {
+                    self.mode_names[c]: round(float(self.best_coefs[c]), 4)
+                    for c in self.change_coef
+                }
             )
-        except Exception as e:  # noqa: BLE001 - the run is ending anyway
-            print(e)
+        )
+
+    def cleanup(self):
+        """Called by navigate when the acquisition ends, however it ends (also
+        after a camera timeout, when the other end functions may not run). If the
+        run did not finish, put the accepted coefficients on the mirror."""
+        if not hasattr(self, "best_coefs") or self.final_written or self.refused:
+            return
+        self.aborted = True  # release a signal thread waiting for the data thread
+        # Stop pressed (navigate also sets stop_acquisition once the signal side
+        # has sent its last frame; if that frame never arrived, the run ended
+        # early).
+        if (
+            getattr(self.model, "stop_acquisition", False)
+            and self.signal_id < self.total_frame_num
+        ):
+            self.finish("stopped")
+            return
+        self.model.logger.warning(
+            "TonyWilson: the acquisition ended before the run finished (for "
+            "example a camera timeout)."
+        )
+        self.finish("ended early")
 
     def in_func_signal(self):
         """Run the signal.
@@ -506,14 +639,19 @@ class TonyWilson(FeatureBase):
 
         out_str += f"\tApply:\t[{' '.join([f'{c:.2f}' for c in applied_coefs])}]\n"
 
-        # Update the mirror...
-        self.mirror_controller.flat()
-        try:
-            self.mirror_controller.display_modes(applied_coefs)
-        except Exception as e:
-            print(e)
-            self.count_mirror_failure()
-            return self.aborted
+        # Update the mirror... under finish_lock, so the end-of-run write can't
+        # be overtaken by this one (navigate may end the run from the data
+        # thread, e.g. after a camera timeout, while this thread is here).
+        with self.finish_lock:
+            if self.final_written:
+                return True
+            self.mirror_controller.flat()
+            try:
+                self.mirror_controller.display_modes(applied_coefs)
+            except Exception as e:
+                print(e)
+                self.count_mirror_failure()
+                return self.aborted
 
         time.sleep(self.model.active_microscope.current_exposure_time / 1000)
 
@@ -587,8 +725,11 @@ class TonyWilson(FeatureBase):
 
         self.frames_done = 0
 
-        #: float: metric of the frame taken with the accepted coefficients.
-        self.reference_metric = None
+        #: float: metric of this sweep's base frame (its middle step, or the base
+        #: frame for an even number of steps), taken with the accepted
+        #: coefficients; the check is compared with it. Nothing carries over to
+        #: the next mode.
+        self.base_metric = None
         #: list: one entry per check frame (for the log and the summary).
         self.decisions = []
 
@@ -706,31 +847,40 @@ class TonyWilson(FeatureBase):
             self.progress.notify_all()
 
     def decide(self, metric, itr, coef):
-        """Keep or undo the last update, judged by the check frame."""
+        """Keep or undo the last update: the check frame (with the update) is
+        compared with this sweep's base frame (the accepted coefficients, without
+        the update). Nothing is carried over to the next mode."""
         c = self.change_coef[coef]
         name = self.mode_names[c]
-        reference = self.reference_metric
-        threshold = reference - CHECK_TOLERANCE * abs(reference)
+        base = self.base_metric
+        self.base_metric = None
+        what = "its middle sweep frame" if self.n_steps % 2 == 1 else "its base frame"
+        threshold = base - CHECK_TOLERANCE * abs(base)
         accepted = bool(metric >= threshold)
         if accepted:
             self.best_coefs = self.candidate_coefs.copy()
-            self.reference_metric = metric
             self.model.logger.info(
                 f"TonyWilson: iteration {itr + 1}/{self.n_iter}, mode {name}: check "
-                f"{float(metric):.6g} vs reference {float(reference):.6g} -> "
+                f"{float(metric):.6g} vs {what} {float(base):.6g} -> "
                 f"accepted, coefficient now {float(self.best_coefs[c]):+.4f}"
             )
         else:
             self.model.logger.warning(
                 f"TonyWilson: iteration {itr + 1}/{self.n_iter}, mode {name}: check "
-                f"{float(metric):.6g} is more than {CHECK_TOLERANCE:.0%} below the "
-                f"reference {float(reference):.6g} -> update "
+                f"{float(metric):.6g} is more than {CHECK_TOLERANCE:.0%} below "
+                f"{what} {float(base):.6g} -> update "
                 f"{float(self.candidate_coefs[c] - self.best_coefs[c]):+.4f} "
                 f"rejected, coefficient stays {float(self.best_coefs[c]):+.4f}"
             )
         self.best_coefs_overall = deepcopy(self.best_coefs)
         self.decisions.append(
-            {"iteration": itr, "mode": name, "accepted": accepted, "check": metric}
+            {
+                "iteration": itr,
+                "mode": name,
+                "accepted": accepted,
+                "check": metric,
+                "base": base,
+            }
         )
 
         if coef == self.n_coefs - 1:
@@ -781,16 +931,17 @@ class TonyWilson(FeatureBase):
             self.frames_done += 1
             out_str += f"\t{kind}: {new_data}\tDone:\t{self.frames_done}\n"
 
-            if kind == "reference":
-                self.reference_metric = new_data
-                self.model.logger.info(f"TonyWilson: reference metric {new_data:.6g}")
-            elif kind == "sweep":
+            if kind == "sweep":
                 self.plot_data.append(new_data)
                 self.model.logger.debug(
                     f"*** TonyWilson > in_func_data :: plot_data: {self.plot_data}"
                 )
+                if self.n_steps % 2 == 1 and step == self.n_steps // 2:
+                    self.base_metric = new_data  # middle step: accepted coefs
                 if step == self.n_steps - 1:
                     self.fit_sweep(itr, coef)
+            elif kind == "base":
+                self.base_metric = new_data
             else:
                 self.decide(new_data, itr, coef)
 
@@ -809,12 +960,12 @@ class TonyWilson(FeatureBase):
         return deepcopy(
             {
                 "mirror_update": {
-                    "mirror_img": self.mirror_img,
+                    "mirror_img": getattr(self, "mirror_img", None),
                     "coefs": self.best_coefs,
                 },
                 "tonywilson": {
                     "peaks": self.best_peaks,
-                    "trace": self.trace_list,
+                    "trace": getattr(self, "trace_list", {}),
                     "done": self.done_all,
                     "metric": self.metric,
                     "iter": self.n_iter,
@@ -834,29 +985,7 @@ class TonyWilson(FeatureBase):
             True if the data is done, False otherwise
         """
         if self.done_all:
-            try:
-                stop_time = time.time()
-                print(f"Total runtime:\t{(stop_time - self.start_time):.3f} sec")
-                rejected = [
-                    (d["iteration"] + 1, d["mode"])
-                    for d in self.decisions
-                    if not d["accepted"]
-                ]
-                self.model.logger.info(
-                    f"TonyWilson: done in {stop_time - self.start_time:.1f} s, "
-                    f"{self.frames_done} frames, "
-                    f"{len(self.decisions) - len(rejected)}/{len(self.decisions)} "
-                    f"updates accepted, rejected (iteration, mode): {rejected}; "
-                    "final coefficients "
-                    + str(
-                        {
-                            self.mode_names[c]: round(float(self.best_coefs[c]), 4)
-                            for c in self.change_coef
-                        }
-                    )
-                )
-            except Exception as e:
-                print(e)
+            print(f"Total runtime:\t{(time.time() - self.start_time):.3f} sec")
 
         try:
             if self.done_itr:
@@ -872,18 +1001,19 @@ class TonyWilson(FeatureBase):
 
         self.done_itr = False
 
-        # Apply the accepted shape once, when the run ends or is stopped. During
-        # the run the signal thread owns the mirror: a write here could land in
-        # the exposure of the next frame.
-        finished = self.done_all or self.aborted or self.model.stop_acquisition
-        if finished and not self.final_written:
-            self.final_written = True
-            self.mirror_controller.display_modes(self.best_coefs)
-            self.model.logger.info(
-                "TonyWilson: mirror set to the accepted coefficients ("
-                + ("run complete" if self.done_all else "run stopped")
-                + ")."
-            )
+        # Apply the accepted shape once, when the run ends, is stopped or aborted
+        # (finish() runs only once). During the run the signal thread owns the
+        # mirror: a write here could land in the exposure of the next frame.
+        if self.done_all:
+            self.finish("complete", notify=False)  # the popup got it just above
+        elif self.aborted:
+            self.finish("aborted")
+        elif self.model.stop_acquisition and self.signal_id < self.total_frame_num:
+            # Stop pressed. (navigate also sets stop_acquisition once the signal
+            # side has sent its last frame; the data thread then still has to
+            # process it, so that is not a stop. If it never arrives, cleanup()
+            # ends the run.)
+            self.finish("stopped")
 
         if self.done_all and self.save_report:
             self.model.event_queue.put(("ao_save_report", self.report))
